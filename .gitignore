@@ -1,0 +1,27 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ---- tooling ----
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- secrets / local env ----
+.env
+.env.local
+
+# ---- runtime artifacts ----
+runtime/
+*.db
+*.db-wal
+*.db-shm
+out.json
+eval/reports/*.json.tmp
+logs/
