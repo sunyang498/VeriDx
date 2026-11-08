@@ -25,3 +25,8 @@ runtime/
 out.json
 eval/reports/*.json.tmp
 logs/
+
+# ---- 文档策略：仓库只上传 README + 设计文档 ----
+# 其余文档（TODO 计划 / 契约变更记录 / 交付文档 / 生成的 openapi）只在本地保留
+doc/*
+!doc/VeriDx-需求与设计文档-v3.1.md
