@@ -1333,20 +1333,24 @@ information_per_budget = 正确诊断数 / (总 token / 10,000)
 | 表 | 作用 | 关键字段 |
 |---|---|---|
 | `questions` | 题目 | `id, course, stem, correct_answer, qtype, difficulty, kp_ids(JSON), source` |
-| `attempts` | 学生作答（**一题 N 条**） | `id, question_id, student_answer, created_at` |
+| `attempts` | 学生作答（**一题 N 条**） | `id, question_id, student_answer, fingerprint, created_at` |
+| `tasks` | 诊断任务（**P0 补齐 C-01**） | `id, attempt_id, run_id, status, terminal, reason_code, idempotency_key, estimated_ms, tokens_in, tokens_out, created_at, updated_at` |
 | `diagnoses` | 诊断结果（核心产物） | 见 §7.2 |
 | `evidence` | 证据（I1 的载体） | `id, run_id, kind, payload(JSON), status, produced_by, seq` |
-| `claims` | 断言-证据绑定 | `id, diagnosis_id, field, value(JSON), evidence_ids(JSON)` |
+| `claims` | 断言-证据绑定 | `id, diagnosis_id, field, value(JSON), evidence_ids(JSON), seq` |
 | `explanation_steps` | 分步讲解 | `id, diagnosis_id, seq, title, content, key_point, targets_error, verifiable` |
 | `similar_questions` | 相似题 | `id, diagnosis_id, stem, answer, solution, check_level, check_passed` |
 | `kp` / `kp_links` | 知识点与关联 | `id, name, parent_id` / `diagnosis_id, kp_id` |
 | `prompt_versions` | **实验变量** | `id, name, arm, version, content, few_shot(JSON), is_active, hash` |
-| `eval_runs` | 一次实验 | `id, arm, dataset_hash, prompt_version_id, model, temperature, seed, k, started_at, finished_at, total_tokens` |
-| `eval_items` | 单条样本结果 | `id, run_id, attempt_id, predicted(JSON), gold(JSON), metrics(JSON), terminal, latency_ms, tokens` |
+| `eval_runs` | 一次实验 | `id, arm, split, dataset_hash, prompt_version_id, model, temperature, seed, seed_policy, k, started_at, finished_at, total_tokens` |
+| `eval_items` | 单条样本结果 | `id, run_id, attempt_id, run_index, seed, predicted(JSON), gold(JSON), metrics(JSON), terminal, latency_ms, tokens` |
 | `trace_events` | 轨迹原子 | `id, run_id, item_id, node, seq, parent_seq, start_ms, end_ms, tokens_in, tokens_out, status, reason_code, detail(JSON)` |
 | `sandbox_rejects` | 沙箱拒绝台账 | `id, run_id, verdict, reason, expr_digest, expr_len` |
 | `redteam_cases` | 红队集 | `id, category, stem, student_answer, target, expect` |
 | `gold_labels` | 人工标注 | `id, attempt_id, error_type_major, key_steps(JSON), first_wrong_step, labeler, labeled_at, round` |
+
+> **物理表数 = 18**（C-10）：上表 15 行中 `kp / kp_links` 为一行二表 → 16 张业务表，+ `tasks`（C-01）+ 元表 `schema_version`。
+> 与 `migrations/001_init.sql` 一一对应；冻结后只允许新增 `00X_*.sql`。
 
 ## 7.2 `diagnoses` 表（逐字段解释）
 
@@ -1365,6 +1369,7 @@ CREATE TABLE diagnoses (
   hypotheses        TEXT,                 -- JSON: Top-3 + confidence
   kp_ids            TEXT,                 -- JSON
   confidence        REAL,
+  needs_review      INTEGER DEFAULT 0,    -- C-02：condition_check 证据的诊断置 1（§3.3.6）
 
   -- 裁决痕迹（评测必需，缺一不可复现）
   terminal          TEXT NOT NULL,        -- diagnosed/escalated/needs_clarification/uncertain
