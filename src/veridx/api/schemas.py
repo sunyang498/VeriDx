@@ -15,6 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from veridx.config import SeedPolicy
 from veridx.guard.claim import Claim, Evidence, EvidenceKind
 from veridx.taxonomy import ErrorType
 from veridx.trace.event import TraceEvent
@@ -82,12 +83,6 @@ class Split(StrEnum):
     REDTEAM = "redteam"
     MR2 = "mr2"
     CI_SUBSET = "ci_subset"
-
-
-class SeedPolicy(StrEnum):
-    FIXED = "fixed"
-    PER_RUN_RECORDED = "per_run_recorded"
-    UNSET = "unset"
 
 
 # ---------------------------------------------------------------------------
