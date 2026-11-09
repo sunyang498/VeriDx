@@ -297,3 +297,50 @@ def test_health_degrades_when_real_model_has_no_key(
 def test_stage_event_accepts_canceled_status() -> None:
     event = StageEventData(stage="diagnose", status="canceled", ms=12, seq=3)
     assert event.status == "canceled"
+
+
+# 16 ------------------------------------------------------------------------
+def test_v1_database_upgrades_without_data_loss(tmp_path: Path) -> None:
+    """002 是**改表**迁移，必须证明"v1 里有数据"也能升上来（否则只能删库重来）。"""
+    import shutil
+
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir()
+    shutil.copy(config.MIGRATIONS_DIR / "001_init.sql", v1_dir / "001_init.sql")
+
+    db = tmp_path / "upgrade.db"
+    conn, applied = store_db.init_db(db, v1_dir)
+    assert applied == [1]
+    conn.execute(
+        "INSERT INTO questions (id, course, stem, correct_answer, kp_ids, created_at)"
+        " VALUES ('q-old', 'calculus', 's', '1', '[]', 't')"
+    )
+    conn.execute(
+        "INSERT INTO attempts (id, question_id, student_answer, fingerprint, created_at)"
+        " VALUES ('a-old', 'q-old', 'e-1', 'digest-old', 't')"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, attempt_id, status, created_at, updated_at)"
+        " VALUES ('t-old', 'a-old', 'queued', 't', 't')"
+    )
+    conn.execute(
+        "INSERT INTO evidence (id, run_id, kind, status, produced_by, seq, created_at)"
+        " VALUES ('ev_1', 'r-old', 'numeric_check', 'ok', 'check_numeric', 1, 't')"
+    )
+    conn.execute(
+        "INSERT INTO gold_labels (id, attempt_id, error_type_major, key_steps, labeler, labeled_at)"
+        " VALUES ('gl-old', 'a-old', '程序性错误', '[]', 'me', 't')"
+    )
+    conn.close()
+
+    upgraded = store_db.connect(db)
+    assert store_db.apply_migrations(upgraded, config.MIGRATIONS_DIR) == [2]
+
+    attempt = upgraded.execute("SELECT * FROM attempts WHERE id='a-old'").fetchone()
+    assert attempt["answer_digest"] == "digest-old"
+    assert upgraded.execute("SELECT COUNT(*) AS n FROM evidence WHERE id='ev_1'").fetchone()["n"] == 1
+    assert upgraded.execute("SELECT COUNT(*) AS n FROM tasks WHERE id='t-old'").fetchone()["n"] == 1
+    label = upgraded.execute("SELECT * FROM gold_labels WHERE id='gl-old'").fetchone()
+    assert label["student_is_correct"] is None  # 未标注保持 NULL，不被默认值污染
+    assert upgraded.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    upgraded.close()
