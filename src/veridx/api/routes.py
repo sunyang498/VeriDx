@@ -73,7 +73,11 @@ def create_attempt(payload: S.AttemptCreate, repo: RepoDep) -> S.AttemptOut:
                 question_id=question["id"], student_answer=payload.student_answer, answer_digest=digest
             )
     except sqlite3.IntegrityError as exc:  # 并发下的兜底：DB 唯一约束才是真相
-        raise ApiError(ErrorCode.DUPLICATE_ATTEMPT, f"该作答已存在（{map_integrity_error(exc)}）") from exc
+        reason = map_integrity_error(exc)
+        if reason == "duplicate_attempt":
+            raise ApiError(ErrorCode.DUPLICATE_ATTEMPT, f"该作答已存在（{reason}）") from exc
+        # 不要把外键失败说成"重复作答"：错误信息指错方向比不报错更糟
+        raise ApiError(ErrorCode.INVALID_INPUT, f"数据约束不满足（{reason}）") from exc
     except RepositoryError as exc:
         raise ApiError(ErrorCode.INVALID_INPUT, str(exc)) from exc
 

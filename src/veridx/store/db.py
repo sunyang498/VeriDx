@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS schema_version (
 )
 """
 
+_TABLE_EXISTS = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
+
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 _LINE_COMMENT = re.compile(r"--[^\n]*")
 
@@ -145,10 +147,26 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connecti
     return conn
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(_TABLE_EXISTS, (name,)).fetchone() is not None
+
+
 def applied_migrations(conn: sqlite3.Connection) -> dict[int, str]:
-    conn.execute(SCHEMA_VERSION_TABLE)
+    """读取已应用的迁移。
+
+    **读路径不执行任何 DDL**：早先这里直接 `CREATE TABLE IF NOT EXISTS`，
+    在只读连接上等于"试图写库"（`attempt to write a readonly database`），
+    于是 `db version` 指向一个陌生文件时给出的报错与病因完全无关（P0.6 审查 §3.1/§3.6）。
+    建表只在写路径（`apply_migrations` 开头的 `ensure_schema_version_table`）发生。
+    """
+    if not _table_exists(conn, "schema_version"):
+        return {}
     rows = conn.execute("SELECT version, checksum FROM schema_version").fetchall()
     return {int(r["version"]): str(r["checksum"]) for r in rows}
+
+
+def ensure_schema_version_table(conn: sqlite3.Connection) -> None:
+    conn.execute(SCHEMA_VERSION_TABLE)
 
 
 def current_version(conn: sqlite3.Connection) -> int:
@@ -199,6 +217,7 @@ def _apply_one(conn: sqlite3.Connection, migration: Migration) -> None:
 def apply_migrations(conn: sqlite3.Connection, migrations_dir: str | Path) -> list[int]:
     """应用未执行的迁移，返回本次新应用的版本号列表。"""
     migrations_dir = Path(migrations_dir)
+    ensure_schema_version_table(conn)
     applied = applied_migrations(conn)
     planned = load_migrations(migrations_dir)
     planned_versions = {m.version for m in planned}

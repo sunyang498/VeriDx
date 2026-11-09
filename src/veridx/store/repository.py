@@ -16,6 +16,9 @@ from contextlib import contextmanager
 from typing import Any
 
 from veridx.clock import new_id, now_utc
+from veridx.trace.event import ReasonCode
+
+_REASON_CODES = frozenset(r.value for r in ReasonCode)
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -137,6 +140,65 @@ class Repository:
         ).fetchone()
         return _row_to_dict(row)
 
+    # ---- evidence ----
+    def create_evidence(
+        self,
+        *,
+        run_id: str,
+        evidence_id: str,
+        kind: str,
+        payload: dict[str, Any],
+        produced_by: str,
+        seq: int,
+        status: str = "ok",
+    ) -> dict[str, Any]:
+        self.conn.execute(
+            "INSERT INTO evidence"
+            " (id, run_id, kind, payload, status, produced_by, seq, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                evidence_id,
+                run_id,
+                kind,
+                json.dumps(payload, ensure_ascii=False),
+                status,
+                produced_by,
+                seq,
+                now_utc(),
+            ),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM evidence WHERE run_id = ? AND id = ?", (run_id, evidence_id)
+        ).fetchone()
+        record = _row_to_dict(row)
+        if record is None:
+            raise RepositoryError(f"证据写入后不可读：{run_id}/{evidence_id}")
+        record["payload"] = json.loads(record["payload"])
+        return record
+
+    def list_evidence(self, run_id: str, evidence_ids: list[str] | None = None) -> list[dict[str, Any]]:
+        """**必须带 `run_id`**：`ev_N` 只在 run 内唯一。
+
+        P0.6 把主键改成 `(run_id, id)` 之后，只按 id 查会**跨 run 串证据**；
+        如果串到的恰好是 `status=ok`，E2 校验会静默通过（比原主键 bug 更隐蔽）。
+        """
+        if evidence_ids is None:
+            rows = self.conn.execute(
+                "SELECT * FROM evidence WHERE run_id = ? ORDER BY seq", (run_id,)
+            ).fetchall()
+        elif not evidence_ids:
+            return []
+        else:
+            placeholders = ",".join("?" * len(evidence_ids))
+            rows = self.conn.execute(
+                f"SELECT * FROM evidence WHERE run_id = ? AND id IN ({placeholders}) ORDER BY seq",
+                (run_id, *evidence_ids),
+            ).fetchall()
+        records = [dict(r) for r in rows]
+        for record in records:
+            record["payload"] = json.loads(record["payload"])
+        return records
+
     # ---- tasks ----
     def create_task(
         self,
@@ -191,6 +253,9 @@ class Repository:
         task = self.get_task(task_id)
         if task is None:
             raise RepositoryError(f"任务不存在：{task_id}")
+        if reason_code is not None and reason_code not in _REASON_CODES:
+            # 自由字符串会让 F1–F8 失败分类统计不出来，而且不会报错
+            raise RepositoryError(f"未知 reason_code：{reason_code}")
         current = task["status"]
         allowed = ALLOWED_TRANSITIONS.get(current, frozenset())
         if target not in allowed:
