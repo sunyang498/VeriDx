@@ -48,13 +48,13 @@ def test_migrations_create_all_tables(conn: sqlite3.Connection) -> None:
 def test_migrations_are_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "veridx.db"
     first_conn, first = store_db.init_db(path, config.MIGRATIONS_DIR)
-    assert first == [1]
-    assert store_db.current_version(first_conn) == 1
+    assert first == [1, 2]
+    assert store_db.current_version(first_conn) == 2
     first_conn.close()
 
     second_conn, second = store_db.init_db(path, config.MIGRATIONS_DIR)
     assert second == []
-    assert store_db.current_version(second_conn) == 1
+    assert store_db.current_version(second_conn) == 2
     second_conn.close()
 
 
@@ -104,17 +104,19 @@ def test_question_attempt_task_roundtrip(conn: sqlite3.Connection) -> None:
     assert question["kp_ids"] == ["kp_int_by_parts"]
 
     attempt = repo.create_attempt(
-        question_id=question["id"], student_answer="e-1", fingerprint="3f9c1a7e0d4b2c88"
+        question_id=question["id"], student_answer="e-1", answer_digest="3f9c1a7e0d4b2c88"
     )
     assert attempt["id"].startswith("a-")
     assert attempt["question_id"] == question["id"]
+    assert attempt["answer_digest"] == "3f9c1a7e0d4b2c88"
 
     task = repo.create_task(attempt_id=attempt["id"], idempotency_key="idem-1", estimated_ms=9000)
     assert task["status"] == "queued"
     assert repo.find_task_by_idempotency_key("idem-1")["id"] == task["id"]
 
-    updated = repo.set_task_status(task["id"], "canceled", terminal="canceled", reason_code="user_canceled")
+    updated = repo.finish_task(task["id"], "canceled", reason_code="user_canceled")
     assert updated["status"] == "canceled"
+    assert updated["terminal"] == "canceled"
     assert updated["reason_code"] == "user_canceled"
 
 

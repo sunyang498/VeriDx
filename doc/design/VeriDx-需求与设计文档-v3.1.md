@@ -1333,10 +1333,10 @@ information_per_budget = 正确诊断数 / (总 token / 10,000)
 | 表 | 作用 | 关键字段 |
 |---|---|---|
 | `questions` | 题目 | `id, course, stem, correct_answer, qtype, difficulty, kp_ids(JSON), source` |
-| `attempts` | 学生作答（**一题 N 条**） | `id, question_id, student_answer, fingerprint, created_at` |
-| `tasks` | 诊断任务（**P0 补齐 C-01**） | `id, attempt_id, run_id, status, terminal, reason_code, idempotency_key, estimated_ms, tokens_in, tokens_out, created_at, updated_at` |
+| `attempts` | 学生作答（**一题 N 条**） | `id, question_id, student_answer, answer_digest, created_at`；**`UNIQUE(question_id, student_answer)`**（C-17，单用户假设） |
+| `tasks` | 诊断任务（**P0 补齐 C-01**） | `id, attempt_id, run_id, status, terminal, reason_code, idempotency_key, estimated_ms, tokens_in, tokens_out, created_at, updated_at`；**CHECK：`status` 非终态时 `terminal IS NULL`，终态时 `terminal = status`**（C-17） |
 | `diagnoses` | 诊断结果（核心产物） | 见 §7.2 |
-| `evidence` | 证据（I1 的载体） | `id, run_id, kind, payload(JSON), status, produced_by, seq` |
+| `evidence` | 证据（I1 的载体） | `id, run_id, kind, payload(JSON), status, produced_by, seq`；**主键 `(run_id, id)`**，`ev_N` 是 run 内编号（C-11） |
 | `claims` | 断言-证据绑定 | `id, diagnosis_id, field, value(JSON), evidence_ids(JSON), seq` |
 | `explanation_steps` | 分步讲解 | `id, diagnosis_id, seq, title, content, key_point, targets_error, verifiable` |
 | `similar_questions` | 相似题 | `id, diagnosis_id, stem, answer, solution, check_level, check_passed` |
@@ -1347,10 +1347,11 @@ information_per_budget = 正确诊断数 / (总 token / 10,000)
 | `trace_events` | 轨迹原子 | `id, run_id, item_id, node, seq, parent_seq, start_ms, end_ms, tokens_in, tokens_out, status, reason_code, detail(JSON)` |
 | `sandbox_rejects` | 沙箱拒绝台账 | `id, run_id, verdict, reason, expr_digest, expr_len` |
 | `redteam_cases` | 红队集 | `id, category, stem, student_answer, target, expect` |
-| `gold_labels` | 人工标注 | `id, attempt_id, error_type_major, key_steps(JSON), first_wrong_step, labeler, labeled_at, round` |
+| `gold_labels` | 人工标注 | `id, attempt_id, error_type_major, key_steps(JSON), first_wrong_step, labeler, labeled_at, round, student_is_correct, answer_key_correct`（后两列可空，见 §10.3.1 的 M18 口径，C-16） |
 
 > **物理表数 = 18**（C-10）：上表 15 行中 `kp / kp_links` 为一行二表 → 16 张业务表，+ `tasks`（C-01）+ 元表 `schema_version`。
-> 与 `migrations/001_init.sql` 一一对应；冻结后只允许新增 `00X_*.sql`。
+> 与 `migrations/001_init.sql` + `002_p0_fixes.sql` 一一对应；冻结后只允许新增 `00X_*.sql`。
+> **命名纪律（C-15）**：含实验坐标（prompt_version / model / seed / arm）的哈希叫 `fingerprint`（决定"能否复用结果"）；只描述内容体的叫 `digest`（决定"是不是同一份输入"）。
 
 ## 7.2 `diagnoses` 表（逐字段解释）
 
@@ -1802,6 +1803,17 @@ pass^5 = C(4,5)/C(5,5) = 0               ← 连续 5 次全对从未发生
 > M18「误判率」= 学生做对被判成做错的比例。**如果数据集里全是"学生一定错了"的题，这个指标的分母是 0，永远算不出来。** 而我把它列为⭐⭐主指标、卖点 #6、NFR-4 的对照基线 —— **没有 MR2 集，这个卖点是空的。**
 >
 > 为什么不并进 held-out（评审曾建议）：那会让 held-out 里混入两类完全不同的判定任务，**M2 的分母被稀释**，而且"held-out 只看一次"的语义会变模糊。**独立子集更干净。**
+
+#### 10.3.1.1 M18 的计算口径（P0.6 冻结，C-16）
+
+| # | 规则 | 为什么 |
+|---|---|---|
+| ① | **分母** = `gold_labels` 中 `student_is_correct IS NOT NULL` 的条数 | 未标注的样本不许悄悄退出分母 |
+| ② | **分母 = 0 时，M18 返回 `n/a` 或直接报错，绝不返回 0** | 返回 0 会被读成"零误判"，是最危险的美化 |
+| ③ | **MR2 集入库必须显式给 `student_is_correct`**（仓储层拒绝 NULL） | 缺值 = 这个卖点的地基缺一块 |
+
+> 对应的表结构：`gold_labels.student_is_correct / answer_key_correct` 两列**可空**（不用 `DEFAULT 0`）。
+> `DEFAULT 0` 会让"没标注"伪装成"学生做错"，从而**静默缩小 M18 的分母** —— 指标变好看，结论变假。
 
 ### 10.3.2 单条样本结构
 

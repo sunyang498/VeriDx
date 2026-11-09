@@ -127,6 +127,7 @@ class AttemptCreate(BaseModel):
 class AttemptOut(BaseModel):
     attempt_id: str
     question_id: str
+    #: wire 名沿用 §8.4 冻结的 `fingerprint`；落地列名是 `attempts.answer_digest`（C-14）
     fingerprint: str
 
 
@@ -353,7 +354,9 @@ class SSEEventName(StrEnum):
 
 class StageEventData(BaseModel):
     stage: str
-    status: Literal["ok", "retry", "fail", "skipped"]
+    # ⚠️ 与 trace 的 NodeStatus 同构（§8.2 契约要求 2）；`canceled` 是 P0.6 补的（C-13），
+    # 否则取消时前端收不到"这一步被取消"
+    status: Literal["ok", "retry", "fail", "skipped", "canceled"]
     ms: int = Field(ge=0)
     seq: int = Field(ge=1)
 

@@ -7,6 +7,8 @@ P0 状态：G0 桩。**能真跑的部分**（题库/作答/任务状态/取消/
 
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi import APIRouter, Header, Response
 
 from veridx import __version__, config
@@ -14,6 +16,7 @@ from veridx.api import schemas as S
 from veridx.api.deps import RepoDep
 from veridx.api.errors import ApiError, ErrorCode, not_implemented
 from veridx.sched.fingerprint import fingerprint
+from veridx.store.repository import RepositoryError, map_integrity_error
 
 router = APIRouter(prefix=S.API_PREFIX)
 
@@ -36,35 +39,51 @@ def create_question(payload: S.QuestionCreate, repo: RepoDep) -> S.QuestionOut:
 # --- 2. 录一次作答 ---------------------------------------------------------
 @router.post("/attempts", response_model=S.AttemptOut, status_code=201, tags=["attempt"])
 def create_attempt(payload: S.AttemptCreate, repo: RepoDep) -> S.AttemptOut:
-    if payload.question is not None:
-        question = repo.create_question(
-            course=payload.question.course,
-            stem=payload.question.stem,
-            correct_answer=payload.question.correct_answer,
-            qtype=payload.question.qtype,
-            difficulty=payload.question.difficulty,
-            kp_ids=payload.question.kp_ids,
-            source=payload.question.source,
-        )
-    else:
-        question = repo.get_question(payload.question_id or "")
-        if question is None:
-            raise ApiError(ErrorCode.NOT_FOUND, f"题目不存在：{payload.question_id}")
+    """建题 + 建作答是一个动作：两步必须同事务，否则会留下孤儿题。"""
+    try:
+        with repo.transaction():
+            if payload.question is not None:
+                question = repo.create_question(
+                    course=payload.question.course,
+                    stem=payload.question.stem,
+                    correct_answer=payload.question.correct_answer,
+                    qtype=payload.question.qtype,
+                    difficulty=payload.question.difficulty,
+                    kp_ids=payload.question.kp_ids,
+                    source=payload.question.source,
+                )
+            else:
+                question = repo.get_question(payload.question_id or "")
+                if question is None:
+                    raise ApiError(ErrorCode.NOT_FOUND, f"题目不存在：{payload.question_id}")
 
-    fp = fingerprint(
-        question=question["stem"],
-        correct=question["correct_answer"],
-        student_answer=payload.student_answer,
-    )
-    attempt = repo.create_attempt(
-        question_id=question["id"], student_answer=payload.student_answer, fingerprint=fp
-    )
-    return S.AttemptOut(attempt_id=attempt["id"], question_id=question["id"], fingerprint=fp)
+            existing = repo.find_attempt(question["id"], payload.student_answer)
+            if existing is not None:
+                raise ApiError(
+                    ErrorCode.DUPLICATE_ATTEMPT,
+                    f"该作答已存在：{existing['id']}（同题同答视为重复样本，避免给某道题偷偷加权）",
+                )
+
+            digest = fingerprint(
+                question=question["stem"],
+                correct=question["correct_answer"],
+                student_answer=payload.student_answer,
+            )
+            attempt = repo.create_attempt(
+                question_id=question["id"], student_answer=payload.student_answer, answer_digest=digest
+            )
+    except sqlite3.IntegrityError as exc:  # 并发下的兜底：DB 唯一约束才是真相
+        raise ApiError(ErrorCode.DUPLICATE_ATTEMPT, f"该作答已存在（{map_integrity_error(exc)}）") from exc
+    except RepositoryError as exc:
+        raise ApiError(ErrorCode.INVALID_INPUT, str(exc)) from exc
+
+    return S.AttemptOut(attempt_id=attempt["id"], question_id=question["id"], fingerprint=digest)
 
 
 # --- 3. 批量导入 -----------------------------------------------------------
 @router.post("/attempts/import", response_model=S.ImportResult, tags=["attempt"])
 def import_attempts(payload: S.ImportPayload) -> S.ImportResult:
+    # P2.2 实现；行级错误映射已就绪（map_integrity_error → duplicate_attempt），不冒 500
     raise not_implemented("P2.2")
 
 
@@ -85,6 +104,13 @@ def diagnose(
     if idempotency_key:
         existing = repo.find_task_by_idempotency_key(idempotency_key)
         if existing is not None:
+            # 幂等键是"这一次请求的身份证"：同一把钥匙开另一扇门必须报错，
+            # 否则评测跑批会静默拿到上一题的结果（不报错，但结论全错）。
+            if existing["attempt_id"] != attempt_id:
+                raise ApiError(
+                    ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                    f"Idempotency-Key 已被用于另一条作答（{existing['attempt_id']}）",
+                )
             response.status_code = 200
             return S.DiagnoseResponse(
                 task_id=existing["id"],
@@ -144,11 +170,10 @@ def cancel_task(task_id: str, repo: RepoDep) -> S.CancelOut:
     task = repo.get_task(task_id)
     if task is None:
         raise ApiError(ErrorCode.NOT_FOUND, f"任务不存在：{task_id}")
-    if task["status"] in set(S.Terminal):
+    if task["terminal"] is not None:
         return S.CancelOut(task_id=task_id, status=S.TaskStatus(task["status"]), already_terminal=True)
-    updated = repo.set_task_status(
-        task_id, "canceled", terminal=S.Terminal.CANCELED.value, reason_code="user_canceled"
-    )
+
+    updated = repo.finish_task(task_id, S.Terminal.CANCELED.value, reason_code="user_canceled")
     return S.CancelOut(task_id=task_id, status=S.TaskStatus(updated["status"]))
 
 
@@ -187,16 +212,17 @@ def get_eval_report(eval_run_id: str, report_format: str = "json") -> S.EvalRepo
 def health(repo: RepoDep) -> S.HealthOut:
     from veridx.store import db as store_db
 
-    schema_version = store_db.current_version(repo.conn)
     provider = S.ProviderHealth(
         mode=config.LLM_MODE,
         model=config.MODEL,
         reachable=None,  # 不做网络探测：健康检查不能因为上游抖动而挂（NFR-6）
         second_model=config.SECOND_MODEL if config.has_second_model() else None,
     )
+    # 需要真实模型却没有 key = 降级；mode=mock 是有意为之，仍算 ok
+    needs_key = config.LLM_MODE in {"real", "auto"} and not config.has_key(config.API_KEY)
     return S.HealthOut(
-        status="ok" if provider.model else "degraded",
+        status="degraded" if needs_key else "ok",
         version=__version__,
-        schema_version=schema_version,
+        schema_version=store_db.current_version(repo.conn),
         provider=provider,
     )

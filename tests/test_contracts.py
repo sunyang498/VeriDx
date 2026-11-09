@@ -41,8 +41,8 @@ EXPECTED_ENDPOINTS: dict[str, set[str]] = {
 
 
 @pytest.fixture(scope="module")
-def spec() -> dict:
-    return create_app(db_path=":memory:").openapi()
+def spec(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    return create_app(db_path=tmp_path_factory.mktemp("spec") / "spec.db").openapi()
 
 
 def test_all_13_endpoints_exist(spec: dict) -> None:

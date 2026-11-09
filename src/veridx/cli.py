@@ -4,6 +4,8 @@
   P0.1  --version / info
   P0.2  db init / db version
   P0.3  serve / contract export
+
+纪律：**只读命令不得产生写副作用**（`db version` 不能顺手建库）。
 """
 
 from __future__ import annotations
@@ -26,7 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     db_sub = db.add_subparsers(dest="db_command")
     db_init = db_sub.add_parser("init", help="建库并应用全部迁移（幂等）")
     db_init.add_argument("--db", default=None, help="数据库路径（默认取 VERIDX_DB_PATH）")
-    db_sub.add_parser("version", help="打印当前 schema 版本")
+    db_version = db_sub.add_parser("version", help="打印当前 schema 版本（只读，不建库）")
+    db_version.add_argument("--db", default=None, help="数据库路径（默认取 VERIDX_DB_PATH）")
 
     serve = sub.add_parser("serve", help="启动 API 服务")
     serve.add_argument("--host", default="127.0.0.1")
@@ -60,16 +63,11 @@ def cmd_db_init(db_path: str | None) -> int:
     return 0
 
 
-def cmd_db_version() -> int:
+def cmd_db_version(db_path: str | None) -> int:
     from veridx.store import db as store_db
 
-    conn = store_db.connect(config.get_settings().db_path)
-    try:
-        print(
-            json.dumps({"version": store_db.current_version(conn), "db": str(config.get_settings().db_path)})
-        )
-    finally:
-        conn.close()
+    path = db_path or str(config.get_settings().db_path)
+    print(json.dumps({"version": store_db.read_version(path), "db": path}))
     return 0
 
 
@@ -81,14 +79,13 @@ def cmd_serve(host: str, port: int, reload: bool) -> int:
 
 
 def _openapi_text() -> str:
-    from veridx.api.app import create_app
+    from veridx.api.app import openapi_spec
 
-    spec = create_app(db_path=":memory:").openapi()
-    return json.dumps(spec, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    return json.dumps(openapi_spec(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 def cmd_contract_export(out: str | None, check: bool) -> int:
-    path = config.PROJECT_ROOT / (out or "doc/openapi.json")
+    path = config.DOC_DIR / (out or "openapi.json")
     text = _openapi_text()
     if check:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -111,7 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.db_command == "init":
             return cmd_db_init(args.db)
         if args.db_command == "version":
-            return cmd_db_version()
+            return cmd_db_version(args.db)
     if args.command == "serve":
         return cmd_serve(args.host, args.port, args.reload)
     if args.command == "contract" and args.contract_command == "export":
