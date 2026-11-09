@@ -181,12 +181,22 @@ def test_evidence_lookup_is_scoped_by_run(conn: sqlite3.Connection) -> None:
     """
     repo = Repository(conn)
     repo.create_evidence(
-        run_id="r-A", evidence_id="ev_1", kind="numeric_check", payload={"equal": False},
-        produced_by="check_numeric", seq=1, status="failed",
+        run_id="r-A",
+        evidence_id="ev_1",
+        kind="numeric_check",
+        payload={"equal": False},
+        produced_by="check_numeric",
+        seq=1,
+        status="failed",
     )
     repo.create_evidence(
-        run_id="r-B", evidence_id="ev_1", kind="numeric_check", payload={"equal": False},
-        produced_by="check_numeric", seq=1, status="ok",
+        run_id="r-B",
+        evidence_id="ev_1",
+        kind="numeric_check",
+        payload={"equal": False},
+        produced_by="check_numeric",
+        seq=1,
+        status="ok",
     )
 
     run_a = repo.list_evidence("r-A", ["ev_1"])
