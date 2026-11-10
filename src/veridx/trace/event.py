@@ -53,6 +53,10 @@ class ReasonCode(StrEnum):
     CALL_BUDGET_EXCEEDED = "call_budget_exceeded"
     USER_CANCELED = "user_canceled"
     INTERNAL_ERROR = "internal_error"
+    #: C-18（P1.6 新增，待登记）：学生答案本来就等于标准答案 —— 没有错因可诊断
+    STUDENT_ANSWER_CORRECT = "student_answer_correct"
+    #: C-18（P1.6 新增，待登记）：盲解三者不一致（模型、学生、答案键互不相同）
+    VERIFIER_DISAGREES = "verifier_disagrees"
 
 
 @dataclass(frozen=True)

@@ -170,9 +170,13 @@ def test_e3_procedural_error_needs_strong_evidence() -> None:
 
 
 def test_e3_reading_error_accepts_condition_check_with_cap_and_review() -> None:
+    """审题性要放宽，必须**同时**满足：实际引用 condition_check + 子类在预枚举内。"""
     decision = bind_claims(
         run_id=RUN,
-        claims=[_claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10)],
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "misread_condition", ["ev_1"], seq=11),
+        ],
         ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
     )
     assert decision.escalate is False
@@ -180,10 +184,94 @@ def test_e3_reading_error_accepts_condition_check_with_cap_and_review() -> None:
     assert decision.needs_review is True
 
 
-def test_e3_reading_error_with_strong_evidence_is_not_capped() -> None:
+def test_e3_reading_error_without_condition_check_is_not_relaxed() -> None:
+    """声明审题性但只引用判不了的 `numeric_check`（skipped）→ 必须 escalate。
+
+    （审查 §6-必1 指定的反向用例：档位不许由模型自述换。）
+    """
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "misread_condition", ["ev_1"], seq=11),
+        ],
+        ledger=[
+            _evidence(
+                "ev_1",
+                1,
+                kind=EvidenceKind.NUMERIC_CHECK,
+                status=EvidenceStatus.SKIPPED,
+                payload={"blocked_reason": "symbolic", "left": {"verdict": "unsupported"}},
+            )
+        ],
+    )
+    assert decision.escalate is True
+    assert (ClaimField.ERROR_TYPE, BindingViolation.EVIDENCE_NOT_OK) in decision.violations
+
+
+def test_e3_reading_relaxation_needs_enumerated_subtype() -> None:
+    """有 condition_check 但子类不在预枚举里（模型自造子类）→ 按强证据要求处理。"""
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "我随便写一个", ["ev_1"], seq=11),
+        ],
+        ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
+    )
+    assert decision.escalate is True
+    assert (ClaimField.ERROR_TYPE, BindingViolation.EVIDENCE_CLASS_MISMATCH) in decision.violations
+
+
+def test_e3_reading_relaxation_requires_subtype_claim_at_all() -> None:
     decision = bind_claims(
         run_id=RUN,
         claims=[_claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10)],
+        ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
+    )
+    assert decision.escalate is True
+
+
+def test_e3_procedural_cannot_borrow_the_reading_tier() -> None:
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "程序性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "misread_condition", ["ev_1"], seq=11),
+        ],
+        ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
+    )
+    assert decision.escalate is True
+    assert (ClaimField.ERROR_TYPE, BindingViolation.EVIDENCE_CLASS_MISMATCH) in decision.violations
+
+
+def test_e3_other_error_needs_student_text_plus_one_more() -> None:
+    """§3.3.3 第三档：`其他` 允许 `student_text` + 任意一条其他证据。"""
+    only_text = bind_claims(
+        run_id=RUN,
+        claims=[_claim(ClaimField.ERROR_TYPE, "其他", ["ev_1"], seq=10)],
+        ledger=[_evidence("ev_1", 1, kind=EvidenceKind.STUDENT_TEXT)],
+    )
+    assert only_text.escalate is True, "只引用学生原话永远撑不起错因"
+
+    with_more = bind_claims(
+        run_id=RUN,
+        claims=[_claim(ClaimField.ERROR_TYPE, "其他", ["ev_1", "ev_2"], seq=10)],
+        ledger=[
+            _evidence("ev_1", 1, kind=EvidenceKind.STUDENT_TEXT),
+            _evidence("ev_2", 2, kind=EvidenceKind.KB_LOOKUP),
+        ],
+    )
+    assert with_more.escalate is False
+
+
+def test_e3_reading_error_with_strong_evidence_is_not_capped() -> None:
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "unit_confusion", ["ev_1"], seq=11),
+        ],
         ledger=[_evidence("ev_1", 1, kind=EvidenceKind.NUMERIC_CHECK)],
     )
     assert decision.escalate is False
@@ -212,17 +300,20 @@ def test_e3_first_divergent_step_needs_step_diff() -> None:
     ) in decision.violations
 
 
-def test_e3_root_cause_can_rely_on_semi_evidence_when_reading_error() -> None:
+def test_e3_root_cause_is_never_relaxed() -> None:
+    """`root_cause` 不随 `error_type` 放宽（审查 §6-必1 第 3 点）。"""
     decision = bind_claims(
         run_id=RUN,
         claims=[
             _claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10),
-            _claim(ClaimField.ROOT_CAUSE, "把条件看反了", ["ev_1"], seq=11),
+            _claim(ClaimField.ERROR_SUBTYPE, "misread_condition", ["ev_1"], seq=11),
+            _claim(ClaimField.ROOT_CAUSE, "把条件看反了", ["ev_1"], seq=12),
         ],
         ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
     )
-    assert decision.escalate is False
-    assert len(decision.accepted) == 2
+    assert (ClaimField.ROOT_CAUSE, BindingViolation.EVIDENCE_CLASS_MISMATCH) in decision.violations
+    assert decision.accepted, "error_type 本身仍可成立（只靠半程序证据，cap 0.5）"
+    assert decision.needs_review is True
 
 
 # --- E5 escalate + 两个分母 ------------------------------------------------
@@ -285,11 +376,65 @@ def test_timeout_is_a_capability_block_not_a_mechanism_fault() -> None:
                 "ev_1",
                 1,
                 status=EvidenceStatus.SKIPPED,
-                payload={"left": {"reason": "eval_timeout"}},
+                payload={"left": {"verdict": "timeout", "reason": "eval_timeout"}},
             )
         ],
     )
     assert decision.escalation_kind is EscalationKind.CAPABILITY
+
+
+def test_step_diff_placeholder_counts_as_capability() -> None:
+    """`step_diff` 占位（`status=not_implemented`）是**能力边界**，不是机制故障。
+
+    上一版去 payload 里找 `reason` 字段 → 找不到 → 误判成 mechanism，
+    报告会得出"机制性问题很严重"的相反结论（审查 §6-必3）。
+    """
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[_claim(ClaimField.ERROR_TYPE, "程序性错误", ["ev_9"], seq=10)],
+        ledger=[
+            _evidence(
+                "ev_1",
+                1,
+                kind=EvidenceKind.STEP_DIFF,
+                status=EvidenceStatus.SKIPPED,
+                payload={
+                    "status": "not_implemented",
+                    "locator": "model",
+                    "note": "P1.8 才做",
+                },
+            )
+        ],
+    )
+    assert decision.escalate is True
+    assert decision.escalation_kind is EscalationKind.CAPABILITY
+    report = over_escalation([decision])
+    assert (report.capability, report.mechanism) == (1, 0)
+
+
+def test_failed_evidence_is_a_mechanism_fault() -> None:
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[_claim(ClaimField.ERROR_TYPE, "程序性错误", ["ev_1"], seq=10)],
+        ledger=[
+            _evidence(
+                "ev_1",
+                1,
+                status=EvidenceStatus.FAILED,
+                payload={"error": "spawn_failed"},
+            )
+        ],
+    )
+    assert decision.escalation_kind is EscalationKind.MECHANISM
+
+
+def test_evidence_without_any_block_reason_is_mechanism() -> None:
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[_claim(ClaimField.ERROR_TYPE, "程序性错误", ["ev_1"], seq=10)],
+        ledger=[_evidence("ev_1", 1, status=EvidenceStatus.SKIPPED, payload={})],
+    )
+    assert decision.escalation_kind is EscalationKind.MECHANISM
 
 
 # --- P7：kb_lookup 产证据 --------------------------------------------------

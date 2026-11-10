@@ -269,6 +269,9 @@ async def _run_gates(
     outcome.gate2_passed = agreed is True
     if outcome.gate2_passed:
         outcome.suspect = Suspect.CONFIRMED
+    elif agreed is None:
+        # "答不出/判不了" 与 "两家不一致" 是两件事，F 类统计不能混（审查 §6-建议🟡5）
+        outcome.notes.append("gate2_no_answer")
     else:
         outcome.notes.append("gate2_disagreed")
 

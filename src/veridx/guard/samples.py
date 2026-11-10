@@ -150,6 +150,22 @@ SAMPLES: tuple[JsonSample, ...] = (
         expect_error="non_finite:-Infinity",
     ),
     JsonSample(
+        "F9_non_finite_overflow",
+        '{"a": 1e999}',
+        False,
+        None,
+        "1e999 是合法 JSON 数字，解析时静默溢出成 inf —— 第三次穿透（审查 §6-必2）",
+        expect_error="non_finite:overflow",
+    ),
+    JsonSample(
+        "F9_non_finite_overflow_single_quoted",
+        "{'a': 1e999}",
+        False,
+        None,
+        "literal_eval 路径同样要拦溢出（递归扫描）",
+        expect_error="non_finite:overflow",
+    ),
+    JsonSample(
         "F9_duplicate_key",
         '{"confidence": 0.9, "confidence": 0.1}',
         False,

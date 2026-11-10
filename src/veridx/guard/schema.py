@@ -47,6 +47,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -187,11 +188,11 @@ def _parse(text: object, max_chars: int) -> ParseOutcome:
         literal = _try_literal_eval(stripped)
         if literal is not None:
             outcome.transformations.append("literal_eval")
-            normalized, fatal = _try_json(json.dumps(literal, ensure_ascii=False))
-            if fatal is not None:
-                outcome.errors.append(fatal)
+            overflow = _find_non_finite(literal)
+            if overflow is not None:
+                # `{'a': 1e999}` 走的是 literal_eval，不经过 json hook
+                outcome.errors.append(f"non_finite:{overflow}")
                 return outcome
-            del normalized
             return _finish(outcome, literal)
 
     # 7 双重编码（F8）
@@ -216,8 +217,38 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"non_finite:{name}")
 
 
+def _reject_overfloat(text: str) -> float:
+    """`1e999` 是**合法 JSON 数字**，`json` 解析时静默溢出成 `inf`（审查 §6-必2）。
+
+    `parse_constant` 只拦字面量 `NaN/Infinity`，拦不到溢出——
+    非有限数的第三次穿透（前两次：沙箱值域、字面量）。
+    """
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non_finite:overflow:{text}")
+    return value
+
+
+def _find_non_finite(value: Any) -> str | None:
+    """递归找非有限浮点（覆盖 `literal_eval` 路径：`{'a': 1e999}` → `inf`）。"""
+    if isinstance(value, float):
+        return None if math.isfinite(value) else "overflow"
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _find_non_finite(key) or _find_non_finite(item)
+            if found:
+                return found
+        return None
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            found = _find_non_finite(item)
+            if found:
+                return found
+    return None
+
+
 def _try_json(text: str) -> tuple[Any, str | None]:
-    """严格 JSON：拒非有限数、拒重复键。
+    """严格 JSON：拒非有限数（字面量与溢出）、拒重复键。
 
     返回 ``(value, fatal)``：
 
@@ -235,12 +266,17 @@ def _try_json(text: str) -> tuple[Any, str | None]:
         return out
 
     try:
-        value = json.loads(text, object_pairs_hook=hook, parse_constant=_reject_constant)
+        value = json.loads(
+            text,
+            object_pairs_hook=hook,
+            parse_constant=_reject_constant,
+            parse_float=_reject_overfloat,
+        )
     except json.JSONDecodeError:
         return None, None
     except ValueError as exc:
         message = str(exc)
-        if message.startswith("non_finite:"):
+        if message.startswith("non_finite"):
             return None, message
         return None, None
     except RecursionError:

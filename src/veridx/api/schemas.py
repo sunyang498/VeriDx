@@ -24,6 +24,17 @@ from veridx.trace.event import TraceEvent
 API_PREFIX = "/api/v1"
 
 
+class StrictModel(BaseModel):
+    """所有对外契约模型的基类：**全局数值契约**（审查 §6-建议🟡7）。
+
+    "任何进入系统边界的浮点值必须 `isfinite`"不是沙箱的规矩，是系统的规矩。
+    上一轮把它落成了"逐字段打补丁"（只给三个 `confidence` 加了 `allow_inf_nan=False`），
+    漏掉了 `temperature` —— 同一个洞换了第三个位置。在基类上声明一次，新字段自动继承。
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+
 # ---------------------------------------------------------------------------
 # 终态 / 状态（§2.3：互斥完备，4 业务 + 2 工程）
 # ---------------------------------------------------------------------------
@@ -89,7 +100,7 @@ class Split(StrEnum):
 # ---------------------------------------------------------------------------
 # 题库与作答（FR-1）
 # ---------------------------------------------------------------------------
-class QuestionCreate(BaseModel):
+class QuestionCreate(StrictModel):
     course: str = Field(min_length=1, max_length=64)
     stem: str = Field(min_length=1)
     #: 入口闸门（§8.5）：标准答案会被送进沙箱求值，长度上限与 SANDBOX_MAX_EXPR_LEN 同源
@@ -100,7 +111,7 @@ class QuestionCreate(BaseModel):
     source: str | None = Field(default=None, max_length=128)
 
 
-class QuestionOut(BaseModel):
+class QuestionOut(StrictModel):
     id: str
     course: str
     stem: str
@@ -112,7 +123,7 @@ class QuestionOut(BaseModel):
     created_at: str
 
 
-class AttemptCreate(BaseModel):
+class AttemptCreate(StrictModel):
     """录一次作答：可内联新题，也可引用已有题目（两者恰择一）。
 
     `student_answer` 有**入口闸门**（§8.5）：长度 ≤ `SANDBOX_MAX_EXPR_LEN`。
@@ -131,26 +142,26 @@ class AttemptCreate(BaseModel):
         return self
 
 
-class AttemptOut(BaseModel):
+class AttemptOut(StrictModel):
     attempt_id: str
     question_id: str
     #: wire 名沿用 §8.4 冻结的 `fingerprint`；落地列名是 `attempts.answer_digest`（C-14）
     fingerprint: str
 
 
-class ImportRowError(BaseModel):
+class ImportRowError(StrictModel):
     row: int = Field(ge=1)
     error: str
 
 
-class ImportPayload(BaseModel):
+class ImportPayload(StrictModel):
     """批量导入（FR-1.2）：原始文本 + 格式，逐行报错不中断。"""
 
     format: Literal["jsonl", "csv"] = "jsonl"
     content: str = Field(min_length=1)
 
 
-class ImportResult(BaseModel):
+class ImportResult(StrictModel):
     total: int = Field(ge=0)
     created: int = Field(ge=0)
     errors: list[ImportRowError] = Field(default_factory=list)
@@ -159,7 +170,7 @@ class ImportResult(BaseModel):
 # ---------------------------------------------------------------------------
 # 诊断任务（FR-2 / §2.5 时序）
 # ---------------------------------------------------------------------------
-class DiagnoseResponse(BaseModel):
+class DiagnoseResponse(StrictModel):
     """202 = 新建任务；200 = 幂等命中已有结果。"""
 
     task_id: str
@@ -171,7 +182,7 @@ class DiagnoseResponse(BaseModel):
     run_id: str | None = None
 
 
-class TaskOut(BaseModel):
+class TaskOut(StrictModel):
     task_id: str
     attempt_id: str
     status: TaskStatus
@@ -182,7 +193,7 @@ class TaskOut(BaseModel):
     updated_at: str
 
 
-class CancelOut(BaseModel):
+class CancelOut(StrictModel):
     task_id: str
     status: TaskStatus
     already_terminal: bool = False
@@ -191,12 +202,12 @@ class CancelOut(BaseModel):
 # ---------------------------------------------------------------------------
 # 诊断结果全文（§8.4）
 # ---------------------------------------------------------------------------
-class Hypothesis(BaseModel):
+class Hypothesis(StrictModel):
     label: str
     confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
 
 
-class ExplanationStepOut(BaseModel):
+class ExplanationStepOut(StrictModel):
     seq: int = Field(ge=1)
     title: str
     content: str
@@ -205,7 +216,7 @@ class ExplanationStepOut(BaseModel):
     verifiable: bool = False
 
 
-class SimilarQuestionOut(BaseModel):
+class SimilarQuestionOut(StrictModel):
     id: str
     stem: str
     answer: str | None = None
@@ -214,12 +225,12 @@ class SimilarQuestionOut(BaseModel):
     check_passed: bool = False
 
 
-class KpOut(BaseModel):
+class KpOut(StrictModel):
     id: str
     name: str
 
 
-class ClaimOut(BaseModel):
+class ClaimOut(StrictModel):
     """**已裁决**的断言（响应/回放用）。
 
     `seq` 是服务端发号器分配的（E4 的判据输入），模型提交的 `Claim` 里没有这个字段
@@ -232,7 +243,7 @@ class ClaimOut(BaseModel):
     seq: int = Field(ge=1)
 
 
-class DiagnosisOut(BaseModel):
+class DiagnosisOut(StrictModel):
     id: str
     attempt_id: str
     run_id: str
@@ -275,7 +286,7 @@ class DiagnosisOut(BaseModel):
 # ---------------------------------------------------------------------------
 # 回放（§11.3）
 # ---------------------------------------------------------------------------
-class TraceEventOut(BaseModel):
+class TraceEventOut(StrictModel):
     """`TraceEvent` 的传输镜像；字段一致性由 tests/test_contracts.py 守护。"""
 
     run_id: str
@@ -296,7 +307,7 @@ class TraceEventOut(BaseModel):
         return cls(**event.to_dict())
 
 
-class ReplayOut(BaseModel):
+class ReplayOut(StrictModel):
     run_id: str
     item_id: str | None = None
     events: list[TraceEventOut] = Field(default_factory=list)
@@ -305,14 +316,14 @@ class ReplayOut(BaseModel):
 # ---------------------------------------------------------------------------
 # 知识点薄弱聚合（FR-5.2）
 # ---------------------------------------------------------------------------
-class WeakKpOut(BaseModel):
+class WeakKpOut(StrictModel):
     kp_id: str
     name: str
     error_count: int = Field(ge=0)
     last_error_at: str | None = None
 
 
-class WeakKpList(BaseModel):
+class WeakKpList(StrictModel):
     total: int = Field(ge=0)
     items: list[WeakKpOut] = Field(default_factory=list)
 
@@ -320,7 +331,7 @@ class WeakKpList(BaseModel):
 # ---------------------------------------------------------------------------
 # 评测（FR-7）
 # ---------------------------------------------------------------------------
-class EvalRunCreate(BaseModel):
+class EvalRunCreate(StrictModel):
     arm: Arm = Arm.D
     split: Split = Split.HELDOUT
     dataset_hash: str | None = None
@@ -330,13 +341,13 @@ class EvalRunCreate(BaseModel):
     prompt_version_id: str | None = None
 
 
-class EvalRunAccepted(BaseModel):
+class EvalRunAccepted(StrictModel):
     eval_run_id: str
     status: TaskStatus
     queued_items: int = Field(ge=0)
 
 
-class EvalReportOut(BaseModel):
+class EvalReportOut(StrictModel):
     eval_run_id: str
     format: Literal["json", "markdown"] = "json"
     content: str
@@ -346,7 +357,7 @@ class EvalReportOut(BaseModel):
 # ---------------------------------------------------------------------------
 # 健康检查（含 provider 可达性）
 # ---------------------------------------------------------------------------
-class ProviderHealth(BaseModel):
+class ProviderHealth(StrictModel):
     mode: str
     #: 工厂真实落地的模式：real / mock / unavailable（配置与落地不一致时必须能看见）
     effective_mode: str = "mock"
@@ -358,7 +369,7 @@ class ProviderHealth(BaseModel):
     require_real_llm: bool = False
 
 
-class HealthOut(BaseModel):
+class HealthOut(StrictModel):
     status: Literal["ok", "degraded"]
     version: str
     schema_version: int
@@ -377,7 +388,7 @@ class SSEEventName(StrEnum):
     DONE = "done"
 
 
-class StageEventData(BaseModel):
+class StageEventData(StrictModel):
     stage: str
     # ⚠️ 与 trace 的 NodeStatus 同构（§8.2 契约要求 2）；`canceled` 是 P0.6 补的（C-13），
     # 否则取消时前端收不到"这一步被取消"
@@ -386,7 +397,7 @@ class StageEventData(BaseModel):
     seq: int = Field(ge=1)
 
 
-class EvidenceEventData(BaseModel):
+class EvidenceEventData(StrictModel):
     """§8.2 的扁平样例（如 `equal`）统一收进 `payload`，见 CHANGELOG C-08。"""
 
     id: str = Field(pattern=r"^ev_\d+$")
@@ -396,17 +407,17 @@ class EvidenceEventData(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
-class ClaimEventData(BaseModel):
+class ClaimEventData(StrictModel):
     field: str
     value: str | list[str]
     evidence_ids: list[str] = Field(min_length=1)
 
 
-class TokenEventData(BaseModel):
+class TokenEventData(StrictModel):
     text: str
 
 
-class GuardEventData(BaseModel):
+class GuardEventData(StrictModel):
     schema_: Literal["pass", "fail", "retry"] = Field(alias="schema")
     evidence_binding: EvidenceBinding
     retries: int = Field(default=0, ge=0)
@@ -414,14 +425,14 @@ class GuardEventData(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class TokenUsage(BaseModel):
+class TokenUsage(StrictModel):
     input_tokens: int = Field(alias="in", ge=0)
     output_tokens: int = Field(alias="out", ge=0)
 
     model_config = ConfigDict(populate_by_name=True)
 
 
-class DoneEventData(BaseModel):
+class DoneEventData(StrictModel):
     terminal: Terminal
     reason_code: str | None = None
     run_id: str
@@ -443,7 +454,7 @@ _EVENT_MODELS: dict[SSEEventName, type[BaseModel]] = {
 }
 
 
-class SSEFrame(BaseModel):
+class SSEFrame(StrictModel):
     """一条 SSE 帧：`event: <name>` + `data: <json>`；解析与生成都用它。"""
 
     event: SSEEventName

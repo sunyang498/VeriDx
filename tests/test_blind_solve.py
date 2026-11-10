@@ -165,6 +165,23 @@ async def test_branch_b_stays_candidate_when_second_model_disagrees() -> None:
     )
     assert outcome.gate2_passed is False
     assert outcome.suspect is Suspect.CANDIDATE
+    assert "gate2_disagreed" in outcome.notes
+
+
+async def test_branch_b_second_model_no_answer_is_not_disagreement() -> None:
+    """第二个模型**答不出**（`None`）≠ **两家不一致**（`False`）——F 类统计不能混。"""
+    provider = _provider(_draft(STUDENT_WRONG))
+    second = MockProvider(responses=[_draft("")], name="mock-second", model="mock-second")
+    outcome = await blind_solve(
+        provider,
+        stem=STEM,
+        correct_answer=KEY,
+        student_answer=STUDENT_WRONG,
+        second_provider=second,
+    )
+    assert outcome.gate2_passed is False
+    assert "gate2_no_answer" in outcome.notes
+    assert "gate2_disagreed" not in outcome.notes
 
 
 async def test_shared_misconception_does_not_confirm_bad_key() -> None:

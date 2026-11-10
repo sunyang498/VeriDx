@@ -70,6 +70,17 @@ SANDBOX_LRU_SIZE = 128
 #: 常驻 worker 池容量（并发请求数决定；超出则排队等空闲 worker）
 SANDBOX_WORKER_POOL_SIZE = 2
 
+# ---- 保留缺陷 TD1 的爆炸半径：按**调用点**计数（审查 §6-建议🟡6）----
+#: 单题沙箱求值次数（每加一个调用点就要改这里，否则预算会系统性低估）：
+#:   blind_solve   3 次判等 × 2 = 6 次（其中 2 次含学生答案，用户可控）
+#:   check_numeric 1 次判等 × 2 = 2 次（其中 1 次含学生答案）
+#:   合计 8 次，3 次含用户输入
+#: TD1（常量折叠绕过指数上限）单次最坏 3.0–4.0s + 重起 0.9s：
+#:   3 次用户可控求值 → ≈14.7s（P1.5 之前是 5 次 / ≈9.8s）
+SANDBOX_EVALS_PER_ITEM = 8
+#: 其中含学生答案（用户可控、可被 TD1 放大）的求值次数
+SANDBOX_USER_CONTROLLED_EVALS_PER_ITEM = 3
+
 # ---- 守卫 / 级联 / 置信度（§3.2 / §5.5）----
 GUARD_MAX_RETRIES = 2
 EVIDENCE_MAX_RETRIES = 2

@@ -17,12 +17,38 @@ from veridx.flow.blind_solve import (
     blind_solve,
     build_messages,
 )
+from veridx.flow.explain import (
+    MIN_STEPS,
+    ExplainDraft,
+    Explanation,
+    ExplanationStep,
+    StepDraft,
+    explain,
+)
+from veridx.flow.runner import (
+    DiagnoseDraft,
+    RunLimits,
+    Runner,
+    RunResult,
+    RunSpec,
+)
 
 __all__ = [
+    "MIN_STEPS",
     "BlindDraft",
     "BlindSolveOutcome",
     "Branch",
+    "DiagnoseDraft",
+    "ExplainDraft",
+    "Explanation",
+    "ExplanationStep",
+    "RunLimits",
+    "RunResult",
+    "RunSpec",
+    "Runner",
+    "StepDraft",
     "Suspect",
     "blind_solve",
     "build_messages",
+    "explain",
 ]

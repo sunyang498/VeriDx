@@ -272,6 +272,146 @@ class Repository:
             raise RepositoryError(f"任务更新后不可读：{task_id}")
         return updated
 
+    # ---- diagnoses / claims / steps（P1.6 单题端到端）----
+    def create_diagnosis(
+        self,
+        *,
+        attempt_id: str,
+        run_id: str,
+        error_type: str,
+        terminal: str,
+        arm: str,
+        prompt_version_id: str,
+        model: str,
+        temperature: float,
+        evidence_binding: str,
+        error_subtype: str | None = None,
+        first_divergent_step: int | None = None,
+        locator: str | None = None,
+        root_cause: str | None = None,
+        hypotheses: list[dict[str, Any]] | None = None,
+        kp_ids: list[str] | None = None,
+        confidence: float | None = None,
+        needs_review: bool = False,
+        reason_code: str | None = None,
+        seed: int | None = None,
+        guard_retries: int = 0,
+        cascade_level: int = 0,
+        verify_agrees: bool | None = None,
+        suspected_bad_answer_key: str = "none",
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        latency_ms: int | None = None,
+        diagnosis_id: str | None = None,
+    ) -> dict[str, Any]:
+        if reason_code is not None and reason_code not in _REASON_CODES:
+            raise RepositoryError(f"未知 reason_code：{reason_code}")
+        diagnosis_id = diagnosis_id or new_id("d")
+        self.conn.execute(
+            "INSERT INTO diagnoses (id, attempt_id, run_id, error_type, error_subtype,"
+            " first_divergent_step, locator, root_cause, hypotheses, kp_ids, confidence,"
+            " needs_review, terminal, reason_code, arm, prompt_version_id, model, temperature,"
+            " seed, evidence_binding, guard_retries, cascade_level, verify_agrees,"
+            " suspected_bad_answer_key, input_tokens, output_tokens, latency_ms, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                diagnosis_id,
+                attempt_id,
+                run_id,
+                error_type,
+                error_subtype,
+                first_divergent_step,
+                locator,
+                root_cause,
+                json.dumps(hypotheses or [], ensure_ascii=False),
+                json.dumps(kp_ids or [], ensure_ascii=False),
+                confidence,
+                int(needs_review),
+                terminal,
+                reason_code,
+                arm,
+                prompt_version_id,
+                model,
+                temperature,
+                seed,
+                evidence_binding,
+                guard_retries,
+                cascade_level,
+                None if verify_agrees is None else int(verify_agrees),
+                suspected_bad_answer_key,
+                input_tokens,
+                output_tokens,
+                latency_ms,
+                now_utc(),
+            ),
+        )
+        row = self.conn.execute("SELECT * FROM diagnoses WHERE id = ?", (diagnosis_id,)).fetchone()
+        record = _row_to_dict(row)
+        if record is None:
+            raise RepositoryError(f"诊断写入后不可读：{diagnosis_id}")
+        return record
+
+    def create_claim(
+        self,
+        *,
+        diagnosis_id: str,
+        field: str,
+        value: str | list[str],
+        evidence_ids: list[str],
+        seq: int,
+        claim_id: str | None = None,
+    ) -> dict[str, Any]:
+        claim_id = claim_id or new_id("c")
+        self.conn.execute(
+            "INSERT INTO claims (id, diagnosis_id, field, value, evidence_ids, seq, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                claim_id,
+                diagnosis_id,
+                field,
+                value if isinstance(value, str) else json.dumps(value, ensure_ascii=False),
+                json.dumps(evidence_ids, ensure_ascii=False),
+                seq,
+                now_utc(),
+            ),
+        )
+        row = self.conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
+        record = _row_to_dict(row)
+        if record is None:
+            raise RepositoryError(f"断言写入后不可读：{claim_id}")
+        return record
+
+    def create_explanation_step(
+        self,
+        *,
+        diagnosis_id: str,
+        seq: int,
+        title: str,
+        content: str,
+        key_point: str | None = None,
+        targets_error: str | None = None,
+        verifiable: bool = False,
+        step_id: str | None = None,
+    ) -> dict[str, Any]:
+        step_id = step_id or new_id("es")
+        self.conn.execute(
+            "INSERT INTO explanation_steps"
+            " (id, diagnosis_id, seq, title, content, key_point, targets_error, verifiable)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (step_id, diagnosis_id, seq, title, content, key_point, targets_error, int(verifiable)),
+        )
+        row = self.conn.execute("SELECT * FROM explanation_steps WHERE id = ?", (step_id,)).fetchone()
+        record = _row_to_dict(row)
+        if record is None:
+            raise RepositoryError(f"讲解步骤写入后不可读：{step_id}")
+        return record
+
+    def link_kp(self, *, diagnosis_id: str, kp_id: str) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO kp_links (diagnosis_id, kp_id) VALUES (?, ?)",
+            (diagnosis_id, kp_id),
+        )
+
     # ---- gold_labels ----
     def create_gold_label(
         self,

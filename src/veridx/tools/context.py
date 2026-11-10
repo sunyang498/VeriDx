@@ -17,9 +17,7 @@
 
 from __future__ import annotations
 
-import itertools
 import sqlite3
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,14 +33,22 @@ class ToolContext:
     symbols: frozenset[str] | None = None
     #: 可注入的计数器起点（测试用）；默认从 1 开始
     start_seq: int = 1
-    _counter: Callable[[], int] = field(init=False, repr=False)
+    #: 无连接时的内存台账（`record_evidence` 的返回值），E2 需要"本 run 的全部证据"
+    drafts: list[dict[str, Any]] = field(default_factory=list)
+    _next_seq: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._counter = itertools.count(self.start_seq).__next__
+        self._next_seq = self.start_seq
 
     # ---- 发号 ----
     def next_seq(self) -> int:
-        return self._counter()
+        seq = self._next_seq
+        self._next_seq += 1
+        return seq
+
+    def peek_next_seq(self) -> int:
+        """下一个将要发出的号（不消耗）。用于断言"占号时机"这类顺序性质。"""
+        return self._next_seq
 
     # ---- 落库 ----
     def record_sandbox(self, result: SandboxResult) -> str | None:
@@ -59,10 +65,10 @@ class ToolContext:
         produced_by: str,
         status: str = "ok",
     ) -> dict[str, Any]:
-        """分配序号并写入证据。返回的 dict 至少含 `id` / `seq` / `kind` / `status`。
+        """分配序号并写入证据。
 
-        没有连接时返回"未持久化"的草稿（P1.6 的控制流可以自己决定落库时机），
-        这样工具层可以脱离数据库单测。
+        没有连接时返回"未持久化"的草稿（挂进 `drafts` 形成内存台账），
+        这样工具层与控制流都能脱离数据库单测。
         """
         seq = self.next_seq()
         record = {
@@ -75,6 +81,7 @@ class ToolContext:
             "seq": seq,
         }
         if self.conn is None:
+            self.drafts.append(record)
             return record
         return Repository(self.conn).create_evidence(
             run_id=self.run_id,

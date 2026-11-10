@@ -1,0 +1,635 @@
+"""受控控制流（P1.6 / 设计文档 §2.3）：5 节点 · 6 终态 · 预算。
+
+## 为什么是"受控"而不是"自主 Agent"
+
+控制流由代码写死，模型只决定**内容**（错因、置信度、讲解），不决定**流程**。
+于是每一步都有名字、有入参出参、能回放 —— 这是可审计与可消融的前提。
+
+```
+parse → blind_solve → check_numeric/step_diff → diagnose(claims) → explain → submit
+```
+
+## 三条结构性保证
+
+1. **终态恰好一个**：所有终态都走 `_finish()`，它设一次值并抛 `_Done` 中断后续节点。
+   任何未被 `_finish` 捕获的异常一律变 `failed`；`CancelledError` 变 `canceled`。
+2. **claim 占号早于产生 claim 的 LLM 调用**（ADR-020）：`reserve_claim_seqs()` 写在
+   `call_structured(diagnose)` **之前**。否则 E4 结构上恒真（审查 §6-必4）。
+3. **预算三重闸**：LLM 调用次数 / token / wall-clock。超了立即 `uncertain`，
+   **不是**"继续跑完再说"（§2.3.2）。
+
+## 降级阶梯（§12.2）
+
+| 档 | 触发 | 本文实现 |
+|---|---|---|
+| 1 | 讲解重试后仍不合法 | `Explanation.degraded=True`，终态仍 `diagnosed` |
+| 2 | 证据不足 | `escalated` + `insufficient_evidence` |
+| 4 | 预算/超时 | `uncertain` + `call_budget_exceeded` / `skipped_budget` / `timed_out` |
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from veridx import config
+from veridx.api.schemas import Arm, EvidenceBinding, Terminal
+from veridx.clock import new_id
+from veridx.flow.blind_solve import BlindSolveOutcome, Branch, Suspect, blind_solve
+from veridx.flow.explain import Explanation, explain
+from veridx.guard.claim import Claim, ClaimField, Evidence
+from veridx.guard.evidence import (
+    BindingDecision,
+    ClaimSeqBlock,
+    ClaimWithSeq,
+    EscalationKind,
+    LedgerEntry,
+    bind_claims,
+    capability_gap,
+    reserve_claim_seqs,
+)
+from veridx.guard.structured import Budget, StructuredOutputError, call_structured
+from veridx.llm.base import LLMProvider
+from veridx.prompts import diagnose as diagnose_prompt
+from veridx.sandbox import Verdict, evaluate
+from veridx.store.repository import Repository
+from veridx.taxonomy import ErrorType
+from veridx.tools.context import ToolContext
+from veridx.tools.dispatch import dispatch
+from veridx.tools.spec import ToolName
+from veridx.trace.event import NodeName, NodeStatus, ReasonCode
+from veridx.trace.recorder import TraceRecorder
+
+__all__ = ["DiagnoseDraft", "RunLimits", "RunResult", "RunSpec", "Runner"]
+
+DEFAULT_MAX_LLM_CALLS = 7
+DEFAULT_MAX_CLAIMS = 5
+
+
+class DiagnoseDraft(BaseModel):
+    """诊断输出契约。
+
+    `claims` 直接复用 `Claim`（`extra="forbid"`）——模型若自带 `seq`，整条 claim 会被
+    pydantic 拒掉并触发回喂重试（这是 §6.1 的反作弊面）。
+    """
+
+    error_type: ErrorType
+    error_subtype: str | None = None
+    root_cause: str = ""
+    first_divergent_step: int | None = None
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+    hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+    kp_ids: list[str] = Field(default_factory=list)
+    claims: list[Claim] = Field(min_length=1)
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    """单题输入。`answer_key` 只在**程序侧**参与判等，盲解阶段看不到它俩（见 blind_solve）。"""
+
+    stem: str
+    student_answer: str
+    answer_key: str
+    attempt_id: str = "a-unknown"
+    question_id: str = "q-unknown"
+    symbols: frozenset[str] | None = None
+    arm: str = Arm.D.value
+    item_id: str | None = None
+
+
+@dataclass
+class RunLimits:
+    """可注入的预算上限（测试用：把上限压到 1 就能验证"立即 uncertain"）。"""
+
+    max_llm_calls: int = DEFAULT_MAX_LLM_CALLS
+    max_tokens: int = config.PER_ITEM_TOKENS
+    max_wall_ms: int = 120_000
+    max_claims: int = DEFAULT_MAX_CLAIMS
+    explain: bool = True
+
+
+@dataclass
+class RunResult:
+    run_id: str
+    terminal: Terminal
+    reason_code: str | None
+    diagnosis: dict[str, Any] | None = None
+    claims: list[ClaimWithSeq] = field(default_factory=list)
+    decision: BindingDecision | None = None
+    blind: BlindSolveOutcome | None = None
+    explanation: Explanation | None = None
+    evidence: list[LedgerEntry] = field(default_factory=list)
+    llm_calls: int = 0
+    tokens: int = 0
+    latency_ms: int = 0
+    #: 终态是因为"能力边界"还是"机制缺陷"（报告口径，§6.2）
+    escalation_kind: EscalationKind | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+class _Done(Exception):
+    """内部信号：终态已确定，中断后续节点。**只有 `_finish` 能抛它。**"""
+
+
+class Runner:
+    """一次 run 的执行器（一个实例只服务一个 run）。"""
+
+    def __init__(
+        self,
+        *,
+        primary: LLMProvider,
+        second: LLMProvider | None = None,
+        conn: Any | None = None,
+        limits: RunLimits | None = None,
+        tracer: TraceRecorder | None = None,
+        run_id: str | None = None,
+        budget: Budget | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.run_id = run_id or new_id("r")
+        self.limits = limits or RunLimits()
+        self.conn = conn
+        self.clock = clock
+        self.primary = primary
+        self.second = second
+        self.budget = budget or Budget(remaining_tokens=self.limits.max_tokens)
+        self.tracer = tracer or TraceRecorder(conn=conn, run_id=self.run_id)
+        self._started = clock()
+        self._llm_calls = 0
+        self._tokens = 0
+        self._terminal: Terminal | None = None
+        self._reason: str | None = None
+        self._blind: BlindSolveOutcome | None = None
+        self._escalation_kind: EscalationKind | None = None
+        self.notes: list[str] = []
+        self.ctx = ToolContext(run_id=self.run_id, conn=conn)
+
+    # ---- 公共入口 ---------------------------------------------------------
+    async def run(self, spec: RunSpec) -> RunResult:
+        self.ctx.symbols = spec.symbols
+        blind: BlindSolveOutcome | None = None
+        decision: BindingDecision | None = None
+        explanation: Explanation | None = None
+        claims: list[ClaimWithSeq] = []
+        diagnosis: dict[str, Any] | None = None
+        try:
+            await self._node_parse(spec)
+            blind = await self._node_blind(spec)
+            self._node_tools(spec, blind)
+            block = self._reserve_claim_block()
+            draft = await self._node_diagnose(spec)
+            claims, decision = self._node_guard(draft, block, item_id=spec.item_id)
+            self._check_confidence(draft, decision)
+            explanation = await self._node_explain(spec, draft, decision)
+            diagnosis = self._node_submit(spec, draft, claims, decision, blind, explanation)
+            self._finish(Terminal.DIAGNOSED, None)
+        except _Done:
+            pass
+        except asyncio.CancelledError:
+            self.notes.append("canceled")
+            self.tracer.event(
+                NodeName.SUBMIT.value,
+                status=NodeStatus.CANCELED,
+                reason_code=ReasonCode.USER_CANCELED.value,
+                detail={"canceled_at": self._llm_calls},
+                item_id=spec.item_id,
+            )
+            self._terminal = Terminal.CANCELED
+            self._reason = ReasonCode.USER_CANCELED.value
+            raise
+        except Exception as exc:  # noqa: BLE001 - 未捕获异常 → failed（可归因）
+            self.tracer.event(
+                NodeName.SUBMIT.value,
+                status=NodeStatus.FAIL,
+                reason_code=ReasonCode.INTERNAL_ERROR.value,
+                detail={"error": f"{type(exc).__name__}: {exc}"[:200]},
+                item_id=spec.item_id,
+            )
+            self.notes.append(f"internal:{type(exc).__name__}")
+            # 这里不能再走 `_finish`：它靠抛 `_Done` 中断流程，而我们已经在异常处理里
+            self._terminal = Terminal.FAILED
+            self._reason = ReasonCode.INTERNAL_ERROR.value
+
+        return RunResult(
+            run_id=self.run_id,
+            terminal=self._terminal or Terminal.FAILED,
+            reason_code=self._reason,
+            diagnosis=diagnosis,
+            claims=claims,
+            decision=decision,
+            blind=blind or self._blind,
+            explanation=explanation,
+            evidence=list(self._ledger()),
+            llm_calls=self._llm_calls,
+            tokens=self._tokens,
+            latency_ms=int((self.clock() - self._started) * 1000),
+            escalation_kind=(
+                decision.escalation_kind if decision and decision.escalation_kind else self._escalation_kind
+            ),
+            notes=self.notes,
+        )
+
+    # ---- 终态与预算 -------------------------------------------------------
+    def _finish(self, terminal: Terminal, reason_code: str | None) -> None:
+        """**唯一**的终态写入口：设一次值，然后中断后续节点。"""
+        if terminal is Terminal.DIAGNOSED:
+            # 成功路径不带 reason_code（设计文档 §8.4 的示例即 null）；
+            # 其余 5 个终态必须可归因 —— 见交付文档的差异声明。
+            pass
+        elif not reason_code:
+            raise AssertionError(f"{terminal.value} 必须带 reason_code（I4：每个终态可归因）")
+        self._terminal = terminal
+        self._reason = reason_code
+        raise _Done
+
+    def _check_budget(self, stage: str) -> None:
+        """每次 LLM 调用前查三重预算；超了立即 uncertain，不继续跑。"""
+        if self._llm_calls >= self.limits.max_llm_calls:
+            self.tracer.event(
+                stage,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.CALL_BUDGET_EXCEEDED.value,
+                detail={"llm_calls": self._llm_calls, "limit": self.limits.max_llm_calls},
+            )
+            self._finish(Terminal.UNCERTAIN, ReasonCode.CALL_BUDGET_EXCEEDED.value)
+        if self._tokens >= self.limits.max_tokens:
+            self.tracer.event(
+                stage,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.SKIPPED_BUDGET.value,
+                detail={"tokens": self._tokens, "limit": self.limits.max_tokens},
+            )
+            self._finish(Terminal.UNCERTAIN, ReasonCode.SKIPPED_BUDGET.value)
+        elapsed_ms = int((self.clock() - self._started) * 1000)
+        if elapsed_ms >= self.limits.max_wall_ms:
+            self.tracer.event(
+                stage,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.TIMED_OUT.value,
+                detail={"elapsed_ms": elapsed_ms, "limit": self.limits.max_wall_ms},
+            )
+            self._finish(Terminal.UNCERTAIN, ReasonCode.TIMED_OUT.value)
+
+    def _spend(self, usage_total: int) -> None:
+        self._llm_calls += 1
+        self._tokens += max(usage_total, 0)
+        self.budget.spend(max(usage_total, 0))
+
+    # ---- 节点 1：parse ---------------------------------------------------
+    async def _node_parse(self, spec: RunSpec) -> None:
+        stem = spec.stem.strip()
+        answer = spec.student_answer.strip()
+        if not stem:
+            raise self._reject(NodeName.PARSE, ReasonCode.UNPARSABLE_STEM, "题干为空")
+        if not answer:
+            raise self._reject(NodeName.PARSE, ReasonCode.UNPARSABLE_ANSWER, "学生答案为空")
+        if len(answer) > config.SANDBOX_MAX_EXPR_LEN:
+            # 与 API 入口闸门同一口径（§8.5），控制流自己也守一道
+            self._finish(Terminal.NEEDS_CLARIFICATION, ReasonCode.UNPARSABLE_ANSWER.value)
+        if not spec.answer_key.strip():
+            raise self._reject(NodeName.PARSE, ReasonCode.UNPARSABLE_STEM, "标准答案为空")
+        self.tracer.event(
+            NodeName.PARSE.value,
+            status=NodeStatus.OK,
+            detail={"stem_len": len(stem), "answer_len": len(answer)},
+            item_id=spec.item_id,
+        )
+
+    def _reject(self, node: str, code: ReasonCode, message: str) -> _Done:
+        self.tracer.event(
+            node,
+            status=NodeStatus.FAIL,
+            reason_code=code.value,
+            detail={"message": message},
+        )
+        self.notes.append(message)
+        self._terminal = Terminal.NEEDS_CLARIFICATION
+        self._reason = code.value
+        return _Done()
+
+    # ---- 节点 2：blind_solve --------------------------------------------
+    async def _node_blind(self, spec: RunSpec) -> BlindSolveOutcome:
+        self._check_budget(NodeName.BLIND_SOLVE.value)
+        outcome = await blind_solve(
+            self.primary,
+            stem=spec.stem,
+            correct_answer=spec.answer_key,
+            student_answer=spec.student_answer,
+            symbols=spec.symbols,
+            tracer=self.tracer,
+            budget=self.budget,
+            second_provider=self.second,
+            item_id=spec.item_id,
+        )
+        self._spend(outcome.usage_total)
+        self._blind = outcome
+
+        if outcome.branch is Branch.S_STUDENT_CORRECT:
+            # 学生本来就对：不许"找出一个错因"（F6 误判率的守门人）
+            self._finish(Terminal.ESCALATED, ReasonCode.STUDENT_ANSWER_CORRECT.value)
+        if outcome.branch is Branch.B_BAD_KEY:
+            # 双闸未过时只记 candidate，对外一律"已提交人工复核"，绝不说"答案错"
+            self._finish(Terminal.ESCALATED, ReasonCode.SUSPECTED_BAD_ANSWER_KEY.value)
+        if outcome.branch is Branch.C_UNCERTAIN:
+            # 判不了 ≠ 判错：能判等但超能力 → sandbox_unsupported；压根没答出来 → schema_invalid
+            code = (
+                ReasonCode.SANDBOX_UNSUPPORTED
+                if "cannot_parse" in outcome.notes
+                else ReasonCode.SCHEMA_INVALID
+            )
+            self._finish(Terminal.UNCERTAIN, code.value)
+        if outcome.branch is Branch.D_DISAGREE:
+            self._finish(Terminal.UNCERTAIN, ReasonCode.VERIFIER_DISAGREES.value)
+        return outcome
+
+    # ---- 节点 3：程序证据（工具层）---------------------------------------
+    def _node_tools(self, spec: RunSpec, blind: BlindSolveOutcome) -> None:
+        observation = dispatch(
+            ToolName.CHECK_NUMERIC,
+            {"expr": spec.answer_key, "value": spec.student_answer},
+            self.ctx,
+        )
+        self.tracer.event(
+            NodeName.CHECK_NUMERIC.value,
+            status=NodeStatus.OK if observation.get("status") == "ok" else NodeStatus.SKIPPED,
+            detail={k: v for k, v in observation.items() if k != "hint"},
+            item_id=spec.item_id,
+        )
+        if blind.steps:
+            dispatch(
+                ToolName.STEP_DIFF,
+                {"model_steps": blind.steps, "student_steps": [spec.student_answer]},
+                self.ctx,
+            )
+
+    # ---- 节点 4：claim 占号 + diagnose -----------------------------------
+    def _reserve_claim_block(self) -> ClaimSeqBlock:
+        """ADR-020：**必须在下面那次 LLM 调用之前**占号。"""
+        return reserve_claim_seqs(self.ctx.next_seq, self.limits.max_claims)
+
+    async def _node_diagnose(self, spec: RunSpec) -> DiagnoseDraft:
+        self._check_budget(NodeName.DIAGNOSE.value)
+        messages = [
+            {"role": "system", "content": "你是数学错题诊断专家，只依据给定证据下结论。"},
+            {
+                "role": "user",
+                "content": diagnose_prompt.render(
+                    stem=spec.stem,
+                    answer_key=spec.answer_key,
+                    student_answer=spec.student_answer,
+                    evidence_block=self._evidence_block(),
+                ),
+            },
+        ]
+        try:
+            result = await call_structured(
+                self.primary,
+                messages,
+                DiagnoseDraft,
+                tracer=self.tracer,
+                budget=self.budget,
+                node=NodeName.DIAGNOSE.value,
+            )
+        except StructuredOutputError as exc:
+            self.notes.append(f"diagnose_failed:{exc.errors[:2]}")
+            self._finish(Terminal.ESCALATED, ReasonCode.SCHEMA_INVALID.value)
+        self._spend(result.usage_total)
+        return result.model if isinstance(result.model, DiagnoseDraft) else DiagnoseDraft(**result.data)
+
+    def _evidence_block(self) -> str:
+        lines = []
+        for entry in self._ledger():
+            evidence = entry.evidence
+            lines.append(
+                f"- {evidence.id} kind={evidence.kind.value} status={evidence.status.value}"
+                f" produced_by={evidence.produced_by} seq={evidence.seq}"
+            )
+        return "\n".join(lines)
+
+    # ---- 节点 5：证据绑定 -------------------------------------------------
+    def _node_guard(
+        self, draft: DiagnoseDraft, block: ClaimSeqBlock, *, item_id: str | None
+    ) -> tuple[list[ClaimWithSeq], BindingDecision]:
+        claims: list[ClaimWithSeq] = []
+        for claim in draft.claims:
+            try:
+                seq = block.take()
+            except IndexError:
+                self.notes.append("too_many_claims")
+                self._finish(Terminal.ESCALATED, ReasonCode.SCHEMA_INVALID.value)
+            claims.append(ClaimWithSeq(claim=claim, seq=seq))
+
+        decision = bind_claims(run_id=self.run_id, claims=claims, ledger=self._ledger())
+        self._trace_guard(decision, claims=claims, stage="guard", item_id=item_id)
+        if decision.escalate:
+            self._finish(Terminal.ESCALATED, ReasonCode.INSUFFICIENT_EVIDENCE.value)
+        return claims, decision
+
+    def _trace_guard(
+        self,
+        decision: BindingDecision,
+        *,
+        claims: list[ClaimWithSeq],
+        stage: str,
+        item_id: str | None,
+    ) -> None:
+        self.tracer.event(
+            NodeName.GUARD.value,
+            status=NodeStatus.OK if not decision.escalate else NodeStatus.FAIL,
+            reason_code=ReasonCode.INSUFFICIENT_EVIDENCE.value if decision.escalate else None,
+            detail={
+                "stage": stage,
+                "escalate": decision.escalate,
+                "escalation_kind": decision.escalation_kind.value if decision.escalation_kind else None,
+                "accepted": len(decision.accepted),
+                "rejected": len(decision.rejected),
+                "violations": [[field.value, reason.value] for field, reason in decision.violations],
+                "confidence_cap": decision.confidence_cap,
+                "needs_review": decision.needs_review,
+                "claim_seqs": [item.seq for item in claims],
+                "evidence_seqs": [entry.evidence.seq for entry in self._ledger()],
+            },
+            item_id=item_id,
+        )
+
+    def _check_confidence(self, draft: DiagnoseDraft, decision: BindingDecision) -> None:
+        effective = min(draft.confidence, decision.confidence_cap)
+        if effective < config.CONFIDENCE_THETA:
+            self.notes.append(f"low_confidence:{effective:.2f}")
+            # 低置信度也分口径：因为"没有 step_diff / 判不了值"而低 = 能力边界
+            self._escalation_kind = (
+                EscalationKind.CAPABILITY
+                if capability_gap(self._ledger(), self.run_id)
+                else EscalationKind.MECHANISM
+            )
+            self.tracer.event(
+                NodeName.GUARD.value,
+                status=NodeStatus.FAIL,
+                reason_code=ReasonCode.LOW_CONFIDENCE.value,
+                detail={
+                    "confidence": effective,
+                    "theta": config.CONFIDENCE_THETA,
+                    "escalation_kind": self._escalation_kind.value,
+                },
+            )
+            self._finish(Terminal.ESCALATED, ReasonCode.LOW_CONFIDENCE.value)
+
+    # ---- 节点 6：讲解（P1.7）---------------------------------------------
+    async def _node_explain(
+        self, spec: RunSpec, draft: DiagnoseDraft, decision: BindingDecision
+    ) -> Explanation | None:
+        if not self.limits.explain:
+            return None
+        self._check_budget(NodeName.EXPLAIN.value)
+        explanation = await explain(
+            self.primary,
+            stem=spec.stem,
+            student_answer=spec.student_answer,
+            error_type=draft.error_type.value,
+            error_subtype=draft.error_subtype,
+            root_cause=draft.root_cause,
+            tracer=self.tracer,
+            budget=self.budget,
+            verify=self._verify_step,
+            item_id=spec.item_id,
+        )
+        self._spend(explanation.usage_total)
+        if explanation.degraded:
+            # 降级阶梯第 1 档：只给结构化诊断，不报错
+            self.notes.append(f"explain_degraded:{explanation.reason}")
+        return explanation
+
+    def _verify_step(self, expr: str) -> bool | None:
+        """讲解步骤的复核：**可求值且有限**才算"可验证"（不是"这一步正确"）。"""
+        result = evaluate(expr, symbols=self.ctx.symbols)
+        self.ctx.record_evidence(
+            kind="numeric_check",
+            payload={"expr": expr, "verdict": result.verdict.value, "reason": result.reason},
+            produced_by=NodeName.EXPLAIN.value,
+            status="ok" if result.verdict is Verdict.OK else "skipped",
+        )
+        return True if result.verdict is Verdict.OK else None
+
+    # ---- 节点 7：submit ---------------------------------------------------
+    def _node_submit(
+        self,
+        spec: RunSpec,
+        draft: DiagnoseDraft,
+        claims: list[ClaimWithSeq],
+        decision: BindingDecision,
+        blind: BlindSolveOutcome,
+        explanation: Explanation | None,
+    ) -> dict[str, Any] | None:
+        error_type_claim = next(
+            (item for item in claims if item.claim.field is ClaimField.ERROR_TYPE),
+            None,
+        )
+        error_type = (
+            str(error_type_claim.claim.value) if error_type_claim is not None else draft.error_type.value
+        )
+        confidence = min(draft.confidence, decision.confidence_cap)
+        diagnosis: dict[str, Any] | None = None
+
+        if self.conn is not None:
+            repo = Repository(self.conn)
+            diagnosis = repo.create_diagnosis(
+                attempt_id=spec.attempt_id,
+                run_id=self.run_id,
+                error_type=error_type,
+                error_subtype=draft.error_subtype,
+                first_divergent_step=draft.first_divergent_step,
+                locator="model",
+                root_cause=draft.root_cause or None,
+                hypotheses=draft.hypotheses,
+                kp_ids=draft.kp_ids,
+                confidence=confidence,
+                needs_review=decision.needs_review,
+                terminal=Terminal.DIAGNOSED.value,
+                arm=spec.arm,
+                prompt_version_id=diagnose_prompt.VERSION,
+                model=getattr(self.primary, "model", "unknown"),
+                temperature=config.DEFAULT_TEMPERATURE,
+                evidence_binding=EvidenceBinding.PASS.value,
+                verify_agrees=blind.suspect is Suspect.CONFIRMED,
+                suspected_bad_answer_key=blind.suspect.value,
+                input_tokens=self._tokens,
+                output_tokens=self._tokens,
+                latency_ms=int((self.clock() - self._started) * 1000),
+            )
+            for item in decision.accepted:
+                repo.create_claim(
+                    diagnosis_id=diagnosis["id"],
+                    field=item.claim.field.value,
+                    value=item.claim.value,
+                    evidence_ids=list(item.claim.evidence_ids),
+                    seq=item.seq,
+                )
+            for step in explanation.steps if explanation else []:
+                repo.create_explanation_step(
+                    diagnosis_id=diagnosis["id"],
+                    seq=step.seq,
+                    title=step.title,
+                    content=step.content,
+                    key_point=step.key_point,
+                    targets_error=step.targets_error,
+                    verifiable=step.verifiable,
+                )
+
+        self.tracer.event(
+            NodeName.SUBMIT.value,
+            status=NodeStatus.OK,
+            detail={
+                "terminal": Terminal.DIAGNOSED.value,
+                "error_type": error_type,
+                "confidence": confidence,
+                "needs_review": decision.needs_review,
+                "steps": len(explanation.steps) if explanation else 0,
+                "verify_agrees": blind.suspect is Suspect.CONFIRMED,
+                "suspected_bad_answer_key": blind.suspect.value,
+                "arm": spec.arm,
+                "prompt_version": diagnose_prompt.VERSION,
+                "prompt_hash": diagnose_prompt.prompt_hash(),
+            },
+            item_id=spec.item_id,
+        )
+        return diagnosis
+
+    # ---- 台账（从 DB 或内存构造，供 E2 使用）-----------------------------
+    def _ledger(self) -> list[LedgerEntry]:
+        if self.conn is None:
+            return [
+                LedgerEntry(
+                    run_id=self.run_id,
+                    evidence=Evidence(
+                        id=record["id"],
+                        kind=record["kind"],
+                        payload=record["payload"],
+                        status=record["status"],
+                        produced_by=record["produced_by"],
+                        seq=record["seq"],
+                    ),
+                )
+                for record in self.ctx.drafts
+            ]
+        rows = Repository(self.conn).list_evidence(self.run_id)
+        entries: list[LedgerEntry] = []
+        for row in rows:
+            entries.append(
+                LedgerEntry(
+                    run_id=self.run_id,
+                    evidence=Evidence(
+                        id=row["id"],
+                        kind=row["kind"],
+                        payload=row["payload"],
+                        status=row["status"],
+                        produced_by=row["produced_by"],
+                        seq=row["seq"],
+                    ),
+                )
+            )
+        return entries
