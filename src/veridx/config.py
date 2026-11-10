@@ -53,15 +53,22 @@ BATCH_WALL_CLOCK_SECONDS = 200
 FIRST_TOKEN_SLA_SECONDS = 3
 
 # ---- 表达式沙箱（§4.4 四层防御）----
+#: 稳态计算预算（**不含** spawn 与 import sympy，见 §4.12）
 SANDBOX_TIMEOUT_SECONDS = 3.0
+#: 冷启动预算（spawn + import sympy ≈1.1s，留足余量）
+SANDBOX_COLD_TIMEOUT_SECONDS = 8.0
 SANDBOX_TERMINATE_GRACE_SECONDS = 1.0
-#: 口径冻结：256（TODO 里写的 4096 与 §4.8.1「300 字符样本必须 rejected」冲突）
+#: **双阈值**：容量内正常判定；介于两者之间是"能力边界"（unsupported:oversize）；
+#: 超过硬上限才是资源攻击（rejected:expr_too_long）
 SANDBOX_MAX_EXPR_LEN = 256
+SANDBOX_HARD_EXPR_LEN = 4096
 SANDBOX_MAX_AST_NODES = 200
 SANDBOX_MAX_EXPONENT = 200
 SANDBOX_MAX_NESTED_POW = 1
 SANDBOX_MAX_INT_LITERAL = 10**9
 SANDBOX_LRU_SIZE = 128
+#: 常驻 worker 池容量（并发请求数决定；超出则排队等空闲 worker）
+SANDBOX_WORKER_POOL_SIZE = 2
 
 # ---- 守卫 / 级联 / 置信度（§3.2 / §5.5）----
 GUARD_MAX_RETRIES = 2

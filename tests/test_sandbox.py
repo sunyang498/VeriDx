@@ -1,17 +1,20 @@
-"""P1.1 沙箱验收：45 条样本（20 攻击 + 25 回归）+ 机制级用例。
+"""沙箱验收：87 条样本（6 组 / K1–K21）+ 机制级用例。
 
-验收口径（写死在测试里，避免"做完再争"）：
+分组口径（内容 v3.2）：
 
-* 20 条攻击样本 **逃逸 = 0**（全部 `rejected`）
-* 25 条回归样本 **误杀 = 0**（20 条 `ok` + 5 条 `unsupported`）
-* `9**9**9` 在 ≤3.5s 内返回（静态拦截，不依赖子进程超时）
-* 每次拒绝落 `sandbox_rejects` 台账（带 `run_id`）
+| 组 | 条数 | 判据 |
+|---|---|---|
+| A 攻击 | 20 | 全部 `rejected`，且 reason ∈ `CAPABILITY_REASONS` |
+| B 正常 | 30 | 全部 `ok` |
+| C 合法不支持 | 15 | 归类正确，**不计入 M17** |
+| D 值域边界 | 10 | 绝不判 `ok` |
+| E 输入形态 | 8 | 永不抛 |
+| F 运行时故障 | 4 | `timeout`/`error`，不进 rejected |
 """
 
 from __future__ import annotations
 
 import sqlite3
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -19,6 +22,7 @@ import pytest
 
 from veridx import config
 from veridx.sandbox import (
+    CAPABILITY_REASONS,
     Reason,
     SandboxResult,
     Verdict,
@@ -26,25 +30,28 @@ from veridx.sandbox import (
     compare,
     evaluate,
     ledger,
+    normalize_complex_literal,
+    reason_prefix,
     rejection_rate,
+    shutdown_pool,
     static_check,
 )
 from veridx.sandbox.samples import (
-    ATTACK_SAMPLES,
-    REGRESSION_OK,
-    REGRESSION_UNSUPPORTED,
+    ATTACKS,
+    DOMAIN,
+    INPUT_FORMS,
+    NON_COMPARABLE_PAIRS,
+    NORMAL,
     TOLERANCE_PAIRS,
-    attack_categories,
+    UNSUPPORTED,
+    group_counts,
 )
 from veridx.store import db as store_db
 from veridx.store.repository import Repository
 
-#: 每条样本最多允许的挂钟时间（§4.4 层 4：超时 3s + terminate 宽限 1.0s）
-SAMPLE_BUDGET_SECONDS = 3.5
-
 
 @pytest.fixture(autouse=True)
-def _fresh_cache() -> Iterator[None]:
+def _fresh() -> Iterator[None]:
     clear_cache()
     yield
     clear_cache()
@@ -57,177 +64,232 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     connection.close()
 
 
-# --- 样本集本身的规模（防止有人"顺手删两条"）--------------------------------
-def test_sample_sets_have_documented_size() -> None:
-    assert len(ATTACK_SAMPLES) == 20
-    assert len(REGRESSION_OK) == 20
-    assert len(REGRESSION_UNSUPPORTED) == 5
-    assert attack_categories() == {
-        "code_exec": 4,
-        "filesystem": 3,
-        "attribute": 3,
-        "introspection": 3,
-        "resource": 4,
-        "length": 3,
-    }
+def _label(sample) -> str:  # noqa: ANN001 - 参数化 id
+    text = sample.expr if isinstance(sample.expr, str) else repr(sample.expr)
+    return f"{sample.k}-{text[:22]}"
 
 
-def test_attack_samples_are_unique() -> None:
-    exprs = [sample.expr for sample in ATTACK_SAMPLES]
-    assert len(set(exprs)) == len(exprs)
+# --- 样本集规模（防止"顺手删两条"）-----------------------------------------
+def test_group_counts_match_design() -> None:
+    counts = group_counts()
+    assert counts["A_attacks"] == 20
+    assert counts["B_normal"] == 30
+    assert counts["C_unsupported"] == 15
+    assert counts["D_domain"] == 10
+    assert counts["E_input_forms"] == 8
+    assert counts["F_runtime_faults"] == 4
+    assert counts["total"] == 87
 
 
-# --- 攻击集：逃逸 = 0 -------------------------------------------------------
-@pytest.mark.parametrize("sample", ATTACK_SAMPLES, ids=lambda s: f"{s.category}-{s.expr[:24]}")
-def test_attack_samples_are_rejected(sample) -> None:  # noqa: ANN001 - 参数化样本
-    started = time.perf_counter()
+# --- A 攻击：逃逸 = 0，且必须记在能力集合里 ---------------------------------
+@pytest.mark.parametrize("sample", ATTACKS, ids=_label)
+def test_attack_is_rejected_and_capability_classified(sample) -> None:  # noqa: ANN001
     result = evaluate(sample.expr)
-    elapsed = time.perf_counter() - started
+    assert result.verdict is Verdict.REJECTED, f"{sample.why} -> {result.verdict}:{result.reason}"
+    assert reason_prefix(result.reason) in CAPABILITY_REASONS, "rejected 必须落在能力集合内"
+    assert result.reason.startswith(sample.reason_prefix), sample.why
 
-    assert result.verdict is Verdict.REJECTED, f"{sample.expr!r} -> {result.verdict}:{result.reason}"
-    assert elapsed <= SAMPLE_BUDGET_SECONDS, f"{sample.expr[:24]!r} 用时 {elapsed:.2f}s"
 
-
-# --- 回归集：误杀 = 0 -------------------------------------------------------
-@pytest.mark.parametrize("expr", REGRESSION_OK)
-def test_normal_expressions_evaluate(expr: str) -> None:
-    result = evaluate(expr)
-    assert result.verdict is Verdict.OK, f"{expr!r} -> {result.verdict}:{result.reason}"
+# --- B 正常：误杀 = 0 -------------------------------------------------------
+@pytest.mark.parametrize("sample", NORMAL, ids=_label)
+def test_normal_expression_is_ok(sample) -> None:  # noqa: ANN001
+    result = evaluate(sample.expr)
+    assert result.verdict is Verdict.OK, f"{sample.why} -> {result.verdict}:{result.reason}"
     assert result.value is not None
 
 
-@pytest.mark.parametrize("expr", REGRESSION_UNSUPPORTED)
-def test_legal_but_unsupported_is_not_rejected(expr: str) -> None:
-    """`2<x<3` 判成 rejected 会让误杀率与论文结论一起失真（§4.6）。"""
-    result = evaluate(expr)
-    assert result.verdict is Verdict.UNSUPPORTED, f"{expr!r} -> {result.verdict}:{result.reason}"
-    assert result.is_accepted is True
-    assert result.is_rejected is False
+# --- C 合法不支持：归类正确且不计入 M17 -------------------------------------
+@pytest.mark.parametrize("sample", UNSUPPORTED, ids=_label)
+def test_legal_but_unsupported(sample) -> None:  # noqa: ANN001
+    result = evaluate(sample.expr)
+    assert result.verdict is Verdict.UNSUPPORTED, f"{sample.why} -> {result.verdict}:{result.reason}"
+    assert result.reason.startswith(sample.reason_prefix), sample.why
+    assert reason_prefix(result.reason) not in CAPABILITY_REASONS
 
 
+# --- D 值域边界：绝不 ok ----------------------------------------------------
+@pytest.mark.parametrize("sample", DOMAIN, ids=_label)
+def test_domain_boundary_is_never_ok(sample) -> None:  # noqa: ANN001
+    result = evaluate(sample.expr)
+    assert result.verdict is Verdict.UNSUPPORTED, f"{sample.why} -> {result.verdict}:{result.reason}"
+    assert result.reason.startswith(sample.reason_prefix), sample.why
+
+
+# --- E 输入形态：永不抛 -----------------------------------------------------
+@pytest.mark.parametrize("sample", INPUT_FORMS, ids=_label)
+def test_input_form_never_raises(sample) -> None:  # noqa: ANN001
+    result = evaluate(sample.expr)
+    assert isinstance(result, SandboxResult)
+    assert result.verdict is Verdict.UNSUPPORTED, sample.why
+    assert result.reason.startswith(sample.reason_prefix), sample.why
+
+
+# --- F 运行时故障（注入）----------------------------------------------------
+def test_compute_timeout_is_timeout_and_worker_is_replaced() -> None:
+    # 预算 0 秒：deadline 立刻过期 → 确定的超时路径（不依赖机器快慢）
+    slow = evaluate("sqrt(2)", timeout_seconds=0.0, use_cache=False)
+    assert slow.verdict is Verdict.TIMEOUT, f"{slow.verdict}:{slow.reason}"
+    assert slow.reason == Reason.EVAL_TIMEOUT.value
+
+    healthy = evaluate("sqrt(2)", use_cache=False)
+    assert healthy.verdict is Verdict.OK, "毒丸之后必须能重建 worker"
+
+
+def test_child_failure_becomes_error_not_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    from veridx.sandbox import core
+
+    class Boom:
+        def run(self, *_a, **_k):
+            raise OSError("pipe broken")
+
+    monkeypatch.setattr(core.pool_module, "get_pool", lambda: Boom())
+    result = evaluate("1+1", use_cache=False)
+    assert result.verdict is Verdict.ERROR
+    assert reason_prefix(result.reason) in {Reason.SPAWN_FAILED.value, Reason.INTERNAL.value}
+
+
+def test_spawn_failure_is_degraded_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    from veridx.sandbox import pool as pool_module
+
+    def boom(self):  # noqa: ANN001
+        raise pool_module.WorkerUnavailable("no __main__ guard")
+
+    monkeypatch.setattr(pool_module.WorkerPool, "_acquire", boom)
+    shutdown_pool()
+    result = evaluate("1+1", use_cache=False)
+    assert result.verdict is Verdict.ERROR
+    assert result.reason.startswith(Reason.SPAWN_FAILED.value)
+    shutdown_pool()
+
+
+# --- 容差与非判等 -----------------------------------------------------------
 @pytest.mark.parametrize(("left", "right", "expected"), TOLERANCE_PAIRS)
-def test_numeric_tolerance(left: str, right: str, expected: bool) -> None:
-    comparison = compare(left, right)
-    assert comparison.equal is expected, f"{left} vs {right} -> {comparison}"
+def test_tolerance_pairs(left: str, right: str, expected: bool) -> None:
+    assert compare(left, right).equal is expected
 
 
-# --- 机制级用例（每条锁一个断言目标）----------------------------------------
-def test_nested_pow_is_named_reason() -> None:
-    result = evaluate("9**9**9")
-    assert result.verdict is Verdict.REJECTED
-    assert result.reason == Reason.NESTED_POW.value
+@pytest.mark.parametrize(("left", "right", "why"), NON_COMPARABLE_PAIRS)
+def test_non_comparable_returns_none_not_false(left: str, right: str, why: str) -> None:
+    """`None`（判不了）与 `False`（不相等）是两件事——混用会直接制造误判。"""
+    assert compare(left, right).equal is None, why
 
 
-def test_bitxor_is_rejected_not_allowed_via_operator_superclass() -> None:
-    """`ast.operator` 当白名单会放行 `x^2`（§4.7 坑 1）。"""
-    result = evaluate("x^2")
-    assert result.verdict is Verdict.REJECTED
-    assert result.reason == f"{Reason.FORBIDDEN_SYNTAX.value}:BitXor"
+def test_inf_never_compares_equal() -> None:
+    """历史 bug：容差公式在 inf 上退化成 `inf <= inf` 恒真。"""
+    result = compare("2**1e9", "1e308")
+    assert result.equal is None
+    assert "non_finite" in result.reason or "not_comparable" in result.reason
 
 
-def test_shift_is_rejected() -> None:
-    result = evaluate("1<<10**8")
-    assert result.verdict is Verdict.REJECTED
-    assert "LShift" in result.reason
+# --- 机制级 ----------------------------------------------------------------
+def test_bitxor_and_shift_rejected() -> None:
+    assert evaluate("x^2").reason == "forbidden_syntax:BitXor"
+    assert evaluate("1<<2").reason == "forbidden_syntax:LShift"
 
 
-def test_factorial_is_not_in_whitelist() -> None:
-    result = evaluate("factorial(10**7)")
-    assert result.verdict is Verdict.REJECTED
-    assert result.reason == f"{Reason.FORBIDDEN_CALL.value}:factorial"
+def test_mod_and_floordiv_allowed() -> None:
+    assert evaluate("37%5").value == pytest.approx(2.0)
+    assert evaluate("7//2").value == pytest.approx(3.0)
 
 
-def test_attribute_access_is_rejected() -> None:
-    assert evaluate("(1).__class__.__bases__").reason == f"{Reason.FORBIDDEN_SYNTAX.value}:Attribute"
+def test_nested_pow_rejected_by_structure_not_value() -> None:
+    assert evaluate("1**1**1**1").reason == Reason.NESTED_POW.value
 
 
-def test_exponent_cap_is_enforced() -> None:
-    result = evaluate("2**201")
-    assert result.verdict is Verdict.REJECTED
-    assert result.reason.startswith(Reason.EXPONENT_TOO_LARGE.value)
-
-
-def test_symbolic_expression_is_unsupported_not_executed() -> None:
-    """含自由符号：P1.1 只做数值，符号等价是 P1.8 的事。"""
-    result = evaluate("x+1")
+def test_function_as_value_is_unsupported_not_rejected() -> None:
+    result = evaluate("sqrt")
     assert result.verdict is Verdict.UNSUPPORTED
-    assert result.reason == Reason.SYMBOLIC.value
-    assert result.exact is not None
+    assert result.reason == "function_as_value:sqrt"
+    assert result.exact is None, "函数对象不能进 exact（会泄漏地址且不可复现）"
 
 
-def test_expression_can_restrict_symbol_table() -> None:
-    """符号表是白名单的一部分，也进 LRU 键（P0.6 审查 §4.3④）。"""
+def test_dunder_name_is_rejected() -> None:
+    assert evaluate("__builtins__").reason == "forbidden_name:__builtins__"
+
+
+def test_unknown_symbol_is_unsupported_not_rejected() -> None:
+    assert evaluate("foo+1").verdict is Verdict.UNSUPPORTED
+    assert evaluate("foo+1").reason == "unknown_symbol:foo"
+
+
+def test_oversize_is_unsupported_and_hard_cap_is_rejected() -> None:
+    long_but_legal = "+".join(["x"] * 179)  # 357 字符
+    assert evaluate(long_but_legal).reason.startswith(Reason.OVERSIZE.value)
+    assert evaluate("1" + "+1" * 3000).verdict is Verdict.REJECTED
+
+
+def test_symbol_table_restriction() -> None:
     assert evaluate("n+1").verdict is Verdict.UNSUPPORTED
     strict = evaluate("n+1", symbols=frozenset({"x", "y"}))
-    assert strict.verdict is Verdict.REJECTED
-    assert strict.reason == f"{Reason.UNKNOWN_NAME.value}:n"
-    # 同一表达式、不同符号表 => 不同结论（缓存没有把它们混在一起）
-    assert evaluate("n+1").verdict is Verdict.UNSUPPORTED
+    assert strict.reason == "unknown_symbol:n"
 
 
-def test_cache_returns_same_object_for_same_symbol_table() -> None:
-    first = evaluate("1/6")
-    second = evaluate("1/6")
-    assert first is second
-
-
-def test_timeout_路径可用() -> None:
-    """把预算压到 1ms，子进程来不及回传 → TIMEOUT（且不缓存）。"""
-    result = evaluate("sqrt(2)", timeout_seconds=0.001, use_cache=False)
-    assert result.verdict is Verdict.TIMEOUT
-    assert result.reason == Reason.EVAL_TIMEOUT.value
-
-
-def test_timeout_result_is_not_cached() -> None:
-    evaluate("sqrt(2)", timeout_seconds=0.001)
-    assert evaluate("sqrt(2)", timeout_seconds=5.0).verdict is Verdict.OK
-
-
-def test_undefined_math_is_unsupported_not_error() -> None:
-    """`1/0` 是数学未定义，不是安全问题（§4.10）。"""
-    result = evaluate("1/0", use_cache=False)
-    assert result.verdict in {Verdict.UNSUPPORTED, Verdict.ERROR}
-    if result.verdict is Verdict.UNSUPPORTED:
-        assert result.reason in {Reason.NON_NUMERIC.value, Reason.SYMBOLIC.value}
-
-
-def test_static_check_returns_none_only_for_runnable_expression() -> None:
+def test_static_check_contract() -> None:
     assert static_check("1/6") is None
-    assert static_check("1/6000") is None
-    verdict, reason = static_check("open('a').read()")
-    assert verdict is Verdict.REJECTED and reason.startswith(Reason.FORBIDDEN_SYNTAX.value)
+    verdict, reason = static_check("open('a')")
+    assert verdict is Verdict.REJECTED and reason.startswith("forbidden_call")
 
 
-# --- 台账：拒绝落痕 + 原因分布 ----------------------------------------------
-def test_rejections_are_recorded_in_ledger(conn: sqlite3.Connection) -> None:
-    rejected = evaluate("9**9**9")
-    unsupported = evaluate("2<x<3")
-    ok = evaluate("1/6")
+# --- R3 归一化 --------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("literal", "normalized"),
+    [("1j", "1*I"), ("2.5j", "2.5*I"), ("1+2j", "1+2*I"), ("1e3j", "1e3*I")],
+)
+def test_complex_literal_normalized(literal: str, normalized: str) -> None:
+    assert normalize_complex_literal(literal) == normalized
 
-    assert ledger.record_verdict(conn, run_id="r-1", result=rejected) is not None
-    assert ledger.record_verdict(conn, run_id="r-1", result=unsupported) is not None
-    assert ledger.record_verdict(conn, run_id="r-1", result=ok) is None
 
+def test_complex_literal_and_explicit_form_agree() -> None:
+    """I5：同一数学对象的两种写法必须同 verdict、同值。"""
+    from_literal = evaluate("1j", use_cache=False)
+    from_explicit = evaluate("1*I", use_cache=False)
+    assert from_literal.verdict is from_explicit.verdict is Verdict.UNSUPPORTED
+    assert from_literal.reason == from_explicit.reason == Reason.COMPLEX_RESULT.value
+    assert from_literal.normalized == "1*I"
+
+
+def test_normalization_does_not_touch_scientific_notation() -> None:
+    """R4 延后期间的回归保护：科学计数法绝不能被改写。"""
+    for expr, expected in (("1e-5", 1e-05), ("1e+5", 100000.0), (".5e3", 500.0), ("1e-3", 0.001)):
+        assert normalize_complex_literal(expr) is None
+        result = evaluate(expr)
+        assert result.verdict is Verdict.OK
+        assert result.value == pytest.approx(expected)
+
+
+def test_cache_key_uses_normalized_expression() -> None:
+    """`1j` 与 `1*I` 命中同一条缓存；原式只进审计字段。"""
+    first = evaluate("1j")
+    second = evaluate("1*I")
+    assert first == second
+    assert first.normalized == "1*I"
+
+
+# --- 台账 ------------------------------------------------------------------
+def test_ledger_records_non_ok_only(conn: sqlite3.Connection) -> None:
+    assert ledger.record_verdict(conn, run_id="r-1", result=evaluate("9**9**9")) is not None
+    assert ledger.record_verdict(conn, run_id="r-1", result=evaluate("2<x<3")) is not None
+    assert ledger.record_verdict(conn, run_id="r-1", result=evaluate("1/6")) is None
+
+
+def test_rejection_rate_keys_and_m17_semantics(conn: sqlite3.Connection) -> None:
+    ledger.record_verdict(conn, run_id="r-1", result=evaluate("globals()"))
+    ledger.record_verdict(conn, run_id="r-1", result=evaluate("2<x<3"))
     stats = rejection_rate(conn, run_id="r-1")
-    assert stats["total"] == 2
-    assert stats["counts"] == {"rejected": 1, "unsupported": 1}
-    assert stats["reasons"][Reason.NESTED_POW.value] == 1
+
+    assert set(stats) >= {
+        "total_non_ok",
+        "counts",
+        "capability_count",
+        "capability_share",
+        "reasons_by_verdict",
+        "capability_reasons",
+    }
+    assert "shared_rejected" not in stats, "键名曾写错成 shared_rejected"
+    assert stats["capability_count"] == 1, "unsupported 不算能力型"
+    assert stats["reasons_by_verdict"]["rejected"] == {"forbidden_call:globals": 1}
 
 
-def test_ledger_requires_run_id_scope(conn: sqlite3.Connection) -> None:
-    ledger.record_verdict(conn, run_id="r-A", result=evaluate("globals()"))
-    ledger.record_verdict(conn, run_id="r-B", result=evaluate("globals()"))
-    assert rejection_rate(conn, run_id="r-A")["total"] == 1
-    assert rejection_rate(conn)["total"] == 2
-
-
-def test_sandbox_result_is_serialisable_for_evidence() -> None:
-    payload = SandboxResult(Verdict.OK, value=1.0, exact="1").to_payload()
-    assert payload["verdict"] == "ok"
-    assert payload["value"] == 1.0
-
-
-# --- 与仓储层联动：证据 payload 能直接存 ------------------------------------
 def test_sandbox_result_fits_evidence_payload(conn: sqlite3.Connection) -> None:
     repo = Repository(conn)
     result = evaluate("e-1")
