@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from veridx import config
 from veridx.config import SeedPolicy
-from veridx.guard.claim import Claim, Evidence, EvidenceKind
+from veridx.guard.claim import ClaimField, Evidence, EvidenceKind
 from veridx.taxonomy import ErrorType
 from veridx.trace.event import TraceEvent
 
@@ -219,6 +219,19 @@ class KpOut(BaseModel):
     name: str
 
 
+class ClaimOut(BaseModel):
+    """**已裁决**的断言（响应/回放用）。
+
+    `seq` 是服务端发号器分配的（E4 的判据输入），模型提交的 `Claim` 里没有这个字段
+    （审查 §6.1）——所以这里不是"模型的 Claim"，而是"被接纳后的 Claim"。
+    """
+
+    field: ClaimField
+    value: str | list[str]
+    evidence_ids: list[str] = Field(min_length=1)
+    seq: int = Field(ge=1)
+
+
 class DiagnosisOut(BaseModel):
     id: str
     attempt_id: str
@@ -236,7 +249,7 @@ class DiagnosisOut(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     needs_review: bool = False
 
-    claims: list[Claim] = Field(default_factory=list)
+    claims: list[ClaimOut] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
     steps: list[ExplanationStepOut] = Field(default_factory=list)
     similar_questions: list[SimilarQuestionOut] = Field(default_factory=list)

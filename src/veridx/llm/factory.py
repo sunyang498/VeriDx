@@ -78,6 +78,8 @@ def build_provider(
         base_url=base_url,
         api_key=api_key,
         name=f"openai_compat:{role}",
+        # 每个 role 有自己的温度（`TEMPERATURE` / `TEMPERATURE_KIMI`）
+        temperature=config.DEFAULT_TEMPERATURE if role == "primary" else config.SECOND_TEMPERATURE,
         transport=transport,
     )
 

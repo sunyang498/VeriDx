@@ -4,7 +4,7 @@
 |---|---|---|
 | `check_numeric` | — | `evidence`（numeric_check）+ `sandbox_rejects`（非 ok 时） |
 | `step_diff` | — | `evidence`（step_diff，占位时 status=skipped） |
-| `kb_lookup` | `kp` | — |
+| `kb_lookup` | `kp` | `evidence`（kb_lookup：全 found→ok，有 missing→skipped） |
 | `escalate` | — | — （终态由控制流写 `finish_task`） |
 """
 
@@ -142,7 +142,15 @@ def kb_lookup(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     found = [dict(row) for row in rows]
     missing = sorted(set(kp_ids) - {item["id"] for item in found})
-    return {"status": "ok", "found": found, "missing": missing}
+    # 查表本身是可验证事实，所以产证据（审查 P7）：全 found → ok，有缺 → skipped。
+    # skipped 的意义是"这次查表不完整"，E2 只认 ok，所以它撑不起 kp_ids 断言。
+    evidence = ctx.record_evidence(
+        kind="kb_lookup",
+        payload={"requested": list(kp_ids), "found": [item["id"] for item in found], "missing": missing},
+        produced_by=ToolName.KB_LOOKUP,
+        status="ok" if not missing else "skipped",
+    )
+    return {"status": "ok", "found": found, "missing": missing, "evidence_id": evidence["id"]}
 
 
 # ---------------------------------------------------------------------------

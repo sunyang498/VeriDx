@@ -41,7 +41,7 @@ class MockProvider:
         self,
         messages: list[dict[str, Any]],
         *,
-        temperature: float = 0.2,
+        temperature: float | None = 0.2,
         seed: int | None = None,
         response_format: str | None = None,
     ) -> ChatResult:

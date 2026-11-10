@@ -128,7 +128,8 @@ async def call_structured(
         try:
             result: ChatResult = await provider.chat(
                 conversation,
-                temperature=config.DEFAULT_TEMPERATURE if temperature is None else temperature,
+                # None = 用 provider 自己的温度（每个 role 的温度不同，不能被这里覆盖）
+                temperature=temperature,
                 seed=seed,
                 response_format="json",
             )

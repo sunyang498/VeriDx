@@ -3,19 +3,30 @@
 守卫有**否决权**：它决定能否落库/返回，而不是"记录校验结果"（设计文档 §2.1 / §3.3）。
 
 P1.3 已实现：`tolerant_parse`（F1–F12）+ `call_structured`（回喂重试 ≤2）。
-证据绑定 E1–E5 在 P1.4。
+P1.4 已实现：E1–E5 证据绑定（`guard.evidence`），claim 序号由服务端发放。
 """
 
 from __future__ import annotations
 
 from veridx.guard.claim import (
     STRONG_EVIDENCE_KINDS,
+    BindingViolation,
     Claim,
     ClaimField,
     Evidence,
     EvidenceKind,
     EvidenceStatus,
     confidence_cap,
+)
+from veridx.guard.evidence import (
+    BindingDecision,
+    ClaimWithSeq,
+    EscalationKind,
+    LedgerEntry,
+    OverEscalationReport,
+    allocate_claim,
+    bind_claims,
+    over_escalation,
 )
 from veridx.guard.schema import ParseOutcome, tolerant_parse
 from veridx.guard.structured import (
@@ -27,16 +38,25 @@ from veridx.guard.structured import (
 
 __all__ = [
     "STRONG_EVIDENCE_KINDS",
+    "BindingDecision",
+    "BindingViolation",
     "Budget",
     "Claim",
     "ClaimField",
+    "ClaimWithSeq",
+    "EscalationKind",
     "Evidence",
     "EvidenceKind",
     "EvidenceStatus",
+    "LedgerEntry",
+    "OverEscalationReport",
     "ParseOutcome",
     "StructuredOutputError",
     "StructuredResult",
+    "allocate_claim",
+    "bind_claims",
     "call_structured",
     "confidence_cap",
+    "over_escalation",
     "tolerant_parse",
 ]

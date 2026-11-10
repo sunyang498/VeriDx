@@ -12,7 +12,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class EvidenceKind(StrEnum):
@@ -72,6 +72,10 @@ EVIDENCE_CONFIDENCE_CAP: dict[EvidenceKind, float] = {EvidenceKind.CONDITION_CHE
 
 
 class Evidence(BaseModel):
+    """**服务端**产生的证据。`seq` 来自 run 级单一发号器（`ToolContext.next_seq`）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
     id: str = Field(pattern=r"^ev_\d+$")
     kind: EvidenceKind
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -81,10 +85,23 @@ class Evidence(BaseModel):
 
 
 class Claim(BaseModel):
+    """模型提交的断言（待裁决）。
+
+    ## 没有 `seq`（审查 §6.1）
+
+    E4 的判据是 `evidence.seq < claim.seq`。若 `seq` 由模型填，它写 `999999`
+    就能让任何证据"早于"自己——这道闸就成了纸糊的。
+    所以：**模型不许提供 `seq`**（`extra="forbid"`，多给一个字段直接 ValidationError），
+    序号由服务端发号器分配（`guard.evidence.allocate_claim`）。
+
+    由此得到一条通用不变量：**任何由模型提供的字段都不得参与顺序 / 时间 / 计数类判断。**
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     field: ClaimField
     value: str | list[str]
     evidence_ids: list[str] = Field(min_length=1)
-    seq: int = Field(ge=1)
 
 
 def confidence_cap(evidence: list[Evidence]) -> float:

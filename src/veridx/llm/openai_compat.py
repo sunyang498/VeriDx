@@ -46,6 +46,8 @@ class OpenAICompatProvider:
         #: 记账（评测成本口径）
         self.total_usage = Usage()
         self.last_attempts = 0
+        #: 提供方强制固定温度时，会去掉 `temperature` 字段重发一次（必须可观察，不许静默改参数）
+        self.temperature_omitted = False
 
     # ---- 元信息（绝不返回密钥）----
     def describe(self) -> dict[str, Any]:
@@ -105,6 +107,17 @@ class OpenAICompatProvider:
                     status_code=response.status_code,
                 )
                 if not retryable:
+                    # 少数模型（kimi-k2 系列、o1 系列…）只接受固定温度，给 400 是"参数不适用"
+                    # 而不是"请求写错了"。去掉该字段重发一次，并在 meta 里留痕：
+                    # 静默改参数是事故，留痕的降级是可解释行为。
+                    if (
+                        response.status_code == 400
+                        and "temperature" in response.text.lower()
+                        and "temperature" in payload
+                    ):
+                        payload.pop("temperature")
+                        self.temperature_omitted = True
+                        continue
                     raise last_error
 
             if attempt < config.LLM_MAX_ATTEMPTS - 1:
@@ -138,6 +151,7 @@ class OpenAICompatProvider:
                 "model": self.model,
                 "attempts": self.last_attempts,
                 "response_id": body.get("id"),
+                "temperature_omitted": self.temperature_omitted,
             },
         )
 

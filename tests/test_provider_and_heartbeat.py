@@ -156,6 +156,55 @@ async def test_http_provider_parses_usage_and_content(monkeypatch: pytest.Monkey
     assert result.usage.total == 15
 
 
+async def test_provider_omits_temperature_when_model_forbids_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """kimi-k2/k3 只接受固定温度，给的是 400 而不是 5xx：去掉字段重发，并留痕。"""
+    monkeypatch.setattr(config, "LLM_BACKOFF_BASE_SECONDS", 0.0)
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "temperature" in body:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "invalid temperature: only 1 is allowed for this model"}},
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}})
+
+    provider = OpenAICompatProvider(
+        model="kimi-probe",
+        base_url="https://api.moonshot.cn/v1",
+        api_key=SECRET,
+        transport=httpx.MockTransport(handler),
+    )
+    result = await provider.chat([{"role": "user", "content": "hi"}], temperature=0.2)
+    assert result.text == "ok"
+    assert "temperature" in bodies[0] and "temperature" not in bodies[-1]
+    assert result.meta["temperature_omitted"] is True, "改参数必须可观察，不许静默"
+
+
+async def test_provider_does_not_swallow_other_400s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "LLM_BACKOFF_BASE_SECONDS", 0.0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "model not found"}})
+
+    provider = OpenAICompatProvider(
+        model="m",
+        base_url="https://api.example.com/v1",
+        api_key=SECRET,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ProviderError) as excinfo:
+        await provider.chat([{"role": "user", "content": "hi"}])
+    assert excinfo.value.retryable is False
+    assert provider.temperature_omitted is False
+
+
 async def test_http_provider_retries_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "LLM_BACKOFF_BASE_SECONDS", 0.0)
     body = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
