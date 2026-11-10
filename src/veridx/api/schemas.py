@@ -15,6 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from veridx import config
 from veridx.config import SeedPolicy
 from veridx.guard.claim import Claim, Evidence, EvidenceKind
 from veridx.taxonomy import ErrorType
@@ -91,7 +92,8 @@ class Split(StrEnum):
 class QuestionCreate(BaseModel):
     course: str = Field(min_length=1, max_length=64)
     stem: str = Field(min_length=1)
-    correct_answer: str = Field(min_length=1)
+    #: 入口闸门（§8.5）：标准答案会被送进沙箱求值，长度上限与 SANDBOX_MAX_EXPR_LEN 同源
+    correct_answer: str = Field(min_length=1, max_length=config.SANDBOX_MAX_EXPR_LEN)
     qtype: str | None = Field(default=None, max_length=32)
     difficulty: str | None = Field(default=None, max_length=8)
     kp_ids: list[str] = Field(default_factory=list)
@@ -111,11 +113,16 @@ class QuestionOut(BaseModel):
 
 
 class AttemptCreate(BaseModel):
-    """录一次作答：可内联新题，也可引用已有题目（两者恰择一）。"""
+    """录一次作答：可内联新题，也可引用已有题目（两者恰择一）。
+
+    `student_answer` 有**入口闸门**（§8.5）：长度 ≤ `SANDBOX_MAX_EXPR_LEN`。
+    它挡掉的是"用超长字符串刷 CPU"这条最廉价的路 ——
+    **入口校验 ≠ 修改沙箱判据**（后者才是刻意保留的隐患）。
+    """
 
     question: QuestionCreate | None = None
     question_id: str | None = None
-    student_answer: str = Field(min_length=1)
+    student_answer: str = Field(min_length=1, max_length=config.SANDBOX_MAX_EXPR_LEN)
 
     @model_validator(mode="after")
     def _exactly_one_question(self) -> AttemptCreate:

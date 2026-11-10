@@ -132,6 +132,17 @@ MODEL = os.getenv("MODEL", "glm-4.6")
 BASE_URL = os.getenv("BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 API_KEY = os.getenv("API_KEY", "").strip()
 
+#: 单次 LLM 请求超时 / 重试（只对 5xx、429、超时重试；4xx 不重试）
+LLM_REQUEST_TIMEOUT_SECONDS = 30.0
+LLM_MAX_ATTEMPTS = 3
+LLM_BACKOFF_BASE_SECONDS = 0.5
+
+#: 结构化守卫：回喂重试上限 / 容错解析的长度上限（超长直接拒绝，不解析）
+GUARD_MAX_RETRIES = 2
+TOLERANT_PARSE_MAX_CHARS = 8192
+#: 落 trace 的原始坏文本最多保留多少字符（超出的只存 sha1，见 trace/secrets）
+RAW_TEXT_KEEP_CHARS = 2000
+
 SECOND_MODEL = os.getenv("SECOND_MODEL", "").strip()
 SECOND_BASE_URL = os.getenv("SECOND_BASE_URL", "").strip()
 SECOND_API_KEY = os.getenv("SECOND_API_KEY", "").strip()

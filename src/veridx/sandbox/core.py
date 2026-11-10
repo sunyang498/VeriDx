@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import math
 import time
@@ -45,6 +46,25 @@ _CACHEABLE = frozenset({Verdict.OK, Verdict.UNSUPPORTED, Verdict.REJECTED})
 
 def expr_digest(expr: str) -> str:
     return hashlib.sha256(expr.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _timeout_reason(expr: str) -> str:
+    """超时的 reason 带一个 **观测标记** `static_gap`（设计文档 §6.3 护栏 1）。
+
+    **纯常量表达式算不完 = 静态防御有洞**（例如 `10**(3*3*…)` 用表达式绕过指数上限）。
+    这里**不改任何判据、不改 verdict、不影响 M17**，只是让洞在台账里可查：
+
+        eval_timeout            ← 含自由符号，可能是真的难算
+        eval_timeout:static_gap ← AST 里没有 Name 节点，纯常量却算不完 = 判据漏了
+
+    `reason_prefix()` 仍返回 `eval_timeout`，所以所有既有口径不变。
+    """
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError, RecursionError):
+        return Reason.EVAL_TIMEOUT.value
+    has_name = any(isinstance(node, ast.Name) for node in ast.walk(tree))
+    return Reason.EVAL_TIMEOUT.value if has_name else f"{Reason.EVAL_TIMEOUT.value}:static_gap"
 
 
 def _normalize_symbols(symbols: frozenset[str] | None) -> tuple[str, ...]:
@@ -178,7 +198,7 @@ def _evaluate(
     except TimeoutError:
         return SandboxResult(
             verdict=Verdict.TIMEOUT,
-            reason=Reason.EVAL_TIMEOUT.value,
+            reason=_timeout_reason(effective),
             expr_digest=digest,
             expr_len=length,
             elapsed_ms=int((time.perf_counter() - started) * 1000),

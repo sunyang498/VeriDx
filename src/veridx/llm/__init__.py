@@ -1,6 +1,20 @@
-"""Provider 抽象：chat / chat_json / chat_tools（OpenAI 兼容，httpx 异步）。
-
-不引 openai SDK：§5.3 要求 HTTP 可被 asyncio 真正中断。
-"""
+"""Provider 抽象：全 async，`describe()` 必进 trace。"""
 
 from __future__ import annotations
+
+from veridx.llm.base import ChatResult, LLMProvider, ProviderError, ToolCall, Usage
+from veridx.llm.factory import ProviderConfigError, build_provider
+from veridx.llm.mock import MockProvider
+from veridx.llm.openai_compat import OpenAICompatProvider
+
+__all__ = [
+    "ChatResult",
+    "LLMProvider",
+    "MockProvider",
+    "OpenAICompatProvider",
+    "ProviderConfigError",
+    "ProviderError",
+    "ToolCall",
+    "Usage",
+    "build_provider",
+]
