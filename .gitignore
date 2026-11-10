@@ -27,9 +27,22 @@ out.json
 eval/reports/*.json.tmp
 logs/
 
-# ---- 文档策略：仓库只上传 README + 设计文档 ----
-# 其余文档（delivery / learn / review / TODO / CHANGELOG / 生成的 openapi）只在本地保留
+# ---- 文档策略（2026-11-10 定稿）：仓库只上传「需求与设计文档」这一份 ----
+# 理由：设计文档是对外承诺（SSOT），其余文档要么是过程材料，要么是给我自己的教学材料。
+#   learn/     教学笔记，写给"未来的我"，不是项目产出
+#   delivery/  开发方交付说明，属于过程留痕
+#   review/    审查意见/审批裁定，属于过程留痕
+#   面试/      面试素材，含对项目的自我批评，不适合公开
+#   TODO / CHANGELOG / openapi.json 都是生成物或阶段性材料
+# 注意：001_init.sql 的注释里引用了下面这份设计文档的路径，且该文件受 checksum 冻结保护，
+#       所以「文件名不能改」——改文件名会导致迁移注释指向不存在的路径。
 /doc/*
 !/doc/design/
 /doc/design/*
 !/doc/design/VeriDx-需求与设计文档-v3.1.md
+
+# 显式列出被忽略的文档目录（`/doc/*` 已覆盖，这里写明是为了让"为什么不上传"一眼可见）
+/doc/learn/
+/doc/delivery/
+/doc/review/
+/doc/面试/
