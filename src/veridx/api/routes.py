@@ -214,16 +214,24 @@ def get_eval_report(eval_run_id: str, report_format: str = "json") -> S.EvalRepo
 # --- 13. 健康检查 ----------------------------------------------------------
 @router.get("/health", response_model=S.HealthOut, tags=["ops"])
 def health(repo: RepoDep) -> S.HealthOut:
+    from veridx.llm import factory as llm_factory
     from veridx.store import db as store_db
 
+    # 声明模式（配置）与落地模式（工厂真实选择）必须都能看见：
+    # `auto` 静默退化成 mock 时，只有后者能揭穿（审查 🟡F1）
+    primary_mode = llm_factory.effective_mode("primary")
+    has_second = config.has_second_model()
     provider = S.ProviderHealth(
         mode=config.LLM_MODE,
+        effective_mode=primary_mode,
         model=config.MODEL,
         reachable=None,  # 不做网络探测：健康检查不能因为上游抖动而挂（NFR-6）
-        second_model=config.SECOND_MODEL if config.has_second_model() else None,
+        second_model=config.SECOND_MODEL if has_second else None,
+        second_effective_mode=llm_factory.effective_mode("second") if has_second else None,
+        require_real_llm=config.REQUIRE_REAL_LLM,
     )
-    # 需要真实模型却没有 key = 降级；mode=mock 是有意为之，仍算 ok
-    needs_key = config.LLM_MODE in {"real", "auto"} and not config.has_key(config.API_KEY)
+    # 要求真模型却拿不到 = 降级；mode=mock 是有意为之，仍算 ok
+    needs_key = config.LLM_MODE in {"real", "auto"} and primary_mode != "real"
     return S.HealthOut(
         status="degraded" if needs_key else "ok",
         version=__version__,

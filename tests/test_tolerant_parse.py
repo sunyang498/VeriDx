@@ -1,12 +1,12 @@
-"""P1.3 验收：容错解析 F1–F12 + 四条不变量（P1–P4）。
+"""P1.3 验收：容错解析 F1–F12 + 四条不变量（J1–J4）。
 
 不变量比样本重要：
 
 ```
-P1  tolerant_parse 对任意输入永不抛
-P2  合法 JSON 的 round-trip：parse(dumps(x)) == x（含中文引号值、含 } 在字符串里）
-P3  宽容解析不得改变任何字符串字段的值（F6 的守门人）
-P4  同一输入两次解析结果相同（无随机性，才能回放）
+J1  tolerant_parse 对任意输入永不抛
+J2  合法 JSON 的 round-trip：parse(dumps(x)) == x（含中文引号值、含 } 在字符串里）
+J3  宽容解析不得改变任何字符串字段的值（F6 的守门人）
+J4  同一输入两次解析结果相同（无随机性，才能回放）
 ```
 """
 
@@ -24,6 +24,16 @@ def _label(sample) -> str:  # noqa: ANN001
     return f"{sample.kind}"
 
 
+def _strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in [k, *_strings(v)]]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
 # --- 分类表覆盖 -------------------------------------------------------------
 def test_every_family_has_at_least_one_sample() -> None:
     families = {sample.kind.split("_")[0] for sample in SAMPLES}
@@ -39,18 +49,27 @@ def test_sample_matches_expected_outcome(sample) -> None:  # noqa: ANN001
         assert sample.expect_transform in outcome.transformations, (
             f"{sample.kind} 期望走 {sample.expect_transform}，实际 {outcome.transformations}"
         )
+    if sample.expect_error:
+        assert outcome.errors, f"{sample.kind} 期望报 {sample.expect_error}，实际成功"
+        assert outcome.errors[0].startswith(sample.expect_error), (
+            f"{sample.kind} 期望 {sample.expect_error}，实际 {outcome.errors}"
+        )
+    if sample.must_preserve:
+        assert sample.must_preserve in _strings(outcome.value), (
+            f"{sample.kind} 改值了：{sample.must_preserve!r} 不在 {_strings(outcome.value)!r}"
+        )
     if sample.parse_ok:
         assert isinstance(outcome.value, (dict, list))
 
 
-# --- P1 永不抛 --------------------------------------------------------------
+# --- J1 永不抛 --------------------------------------------------------------
 @pytest.mark.parametrize("bad", NEVER_RAISE_INPUTS, ids=lambda v: repr(v)[:20])
-def test_p1_tolerant_parse_never_raises(bad: object) -> None:
+def test_j1_tolerant_parse_never_raises(bad: object) -> None:
     outcome = tolerant_parse(bad)
     assert isinstance(outcome.errors, list)
 
 
-# --- P2 round-trip ----------------------------------------------------------
+# --- J2 round-trip ----------------------------------------------------------
 @pytest.mark.parametrize(
     "payload",
     [
@@ -61,18 +80,18 @@ def test_p1_tolerant_parse_never_raises(bad: object) -> None:
         {"unicode": "积分 ∫_0^1 x·e^x dx"},
     ],
 )
-def test_p2_roundtrip_preserves_payload(payload: dict) -> None:
+def test_j2_roundtrip_preserves_payload(payload: dict) -> None:
     outcome = tolerant_parse(json.dumps(payload, ensure_ascii=False))
     assert outcome.ok
     assert outcome.value == payload
 
 
-def test_p2_roundtrip_with_ascii_escapes() -> None:
+def test_j2_roundtrip_with_ascii_escapes() -> None:
     payload = {"a": "line\nbreak", "b": 'quote"inside'}
     assert tolerant_parse(json.dumps(payload)).value == payload
 
 
-# --- P3 不改值（F6 守门人）--------------------------------------------------
+# --- J3 不改值（F6 守门人）--------------------------------------------------
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -82,21 +101,21 @@ def test_p2_roundtrip_with_ascii_escapes() -> None:
         ('{"a": "含,逗号和}括号,"}', "含,逗号和}括号,"),
     ],
 )
-def test_p3_string_values_are_byte_identical(raw: str, expected: str) -> None:
+def test_j3_string_values_are_byte_identical(raw: str, expected: str) -> None:
     outcome = tolerant_parse(raw)
     assert outcome.ok, outcome.errors
     assert outcome.value["root_cause" if "root_cause" in outcome.value else "a"] == expected
 
 
-def test_p3_structural_quotes_still_normalized() -> None:
+def test_j3_structural_quotes_still_normalized() -> None:
     outcome = tolerant_parse("{“error_type”: “程序性错误”}")
     assert outcome.ok
     assert outcome.value == {"error_type": "程序性错误"}
 
 
-# --- P4 确定性 --------------------------------------------------------------
+# --- J4 确定性 --------------------------------------------------------------
 @pytest.mark.parametrize("sample", SAMPLES[:8], ids=_label)
-def test_p4_parsing_is_deterministic(sample) -> None:  # noqa: ANN001
+def test_j4_parsing_is_deterministic(sample) -> None:  # noqa: ANN001
     first = tolerant_parse(sample.raw)
     second = tolerant_parse(sample.raw)
     assert first.value == second.value

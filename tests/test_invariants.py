@@ -1,10 +1,10 @@
-"""不变量测试（I1–I8 + 并发/回收）。
+"""不变量测试（S1–S8 + 并发/回收）。
 
 样本证明"这 87 条对"；**不变量才证明"任何输入都对"**。
 这是审批意见 §5 新增 7 项要求的落地处：
 
-* +1 I4 的 rejected 原因集**不含** function_as_value / oversize / unknown_symbol
-* +2 `CAPABILITY_REASONS` 是唯一常量，且有测试断言它与 I4 一致
+* +1 S4 的 rejected 原因集**不含** function_as_value / oversize / unknown_symbol
+* +2 `CAPABILITY_REASONS` 是唯一常量，且有测试断言它与 S4 一致
 * +3 并发安全：2 线程 × 20 次求值，结果与串行一致
 * +4 退出回收：结束后 worker 进程数归零
 * +6 `1e-5` 仍为 `1e-05`
@@ -46,8 +46,8 @@ def _fresh() -> None:
     clear_cache()
 
 
-# --- I1 ----------------------------------------------------------------------
-def test_i1_ok_implies_finite_value() -> None:
+# --- S1 ----------------------------------------------------------------------
+def test_s1_ok_implies_finite_value() -> None:
     """任何 `ok` 的结果，value 必须是有限实数。"""
     for sample in NORMAL + DOMAIN:
         result = evaluate(sample.expr)
@@ -56,8 +56,8 @@ def test_i1_ok_implies_finite_value() -> None:
             assert math.isfinite(result.value), f"{sample.expr!r} 得到非有限值 {result.value}"
 
 
-# --- I2 ----------------------------------------------------------------------
-def test_i2_equal_true_requires_both_sides_numeric() -> None:
+# --- S2 ----------------------------------------------------------------------
+def test_s2_equal_true_requires_both_sides_numeric() -> None:
     """`equal=True` 只能发生在两侧都是 `ok` 且有限的时候。"""
     pairs = [
         ("1/3", "0.333333"),
@@ -74,18 +74,18 @@ def test_i2_equal_true_requires_both_sides_numeric() -> None:
             assert left_result.is_numeric and right_result.is_numeric, (left, right)
 
 
-# --- I3 ----------------------------------------------------------------------
+# --- S3 ----------------------------------------------------------------------
 @pytest.mark.parametrize(
     "bad",
     [None, 123, b"1+1", {}, [], "（", "1+", "\x00", "😀", 3.14, True, object(), "", "   ", ")" * 300],
 )
-def test_i3_evaluate_never_raises(bad: object) -> None:
+def test_s3_evaluate_never_raises(bad: object) -> None:
     result = evaluate(bad, use_cache=False)
     assert result.verdict in set(Verdict), f"{bad!r} 返回了非法 verdict"
 
 
-# --- I4 + 审批 +1/+2 ---------------------------------------------------------
-def test_i4_rejected_iff_capability() -> None:
+# --- S4 + 审批 +1/+2 ---------------------------------------------------------
+def test_s4_rejected_iff_capability() -> None:
     """`rejected` ⟺ reason ∈ `CAPABILITY_REASONS`（双向）。这是 M17 的唯一口径。
 
     单向断言（只查 rejected ⊆ capability）挡不住"把 oversize 塞进 rejected"，
@@ -129,8 +129,8 @@ def test_reason_sets_partition_the_enum() -> None:
     assert all_reasons == classified, f"未归类的原因：{all_reasons - classified}"
 
 
-# --- I5 ----------------------------------------------------------------------
-def test_i5_same_math_object_same_verdict() -> None:
+# --- S5 ----------------------------------------------------------------------
+def test_s5_same_math_object_same_verdict() -> None:
     """同一数学对象的两种写法必须同 verdict 类别。"""
     pairs = [
         ("1j", "1*I"),
@@ -144,8 +144,8 @@ def test_i5_same_math_object_same_verdict() -> None:
     assert evaluate("1j").reason == evaluate("1*I").reason == "complex_result"
 
 
-# --- I6 ----------------------------------------------------------------------
-def test_i6_every_result_has_parseable_reason() -> None:
+# --- S6 ----------------------------------------------------------------------
+def test_s6_every_result_has_parseable_reason() -> None:
     known = CAPABILITY_REASONS | UNSUPPORTED_REASONS | ERROR_REASONS | {"eval_timeout"}
     for sample in ATTACKS + NORMAL + UNSUPPORTED + DOMAIN:
         result = evaluate(sample.expr)
@@ -155,8 +155,8 @@ def test_i6_every_result_has_parseable_reason() -> None:
         assert reason_prefix(result.reason) in known, f"{sample.expr!r} -> {result.reason!r}"
 
 
-# --- I8 ----------------------------------------------------------------------
-def test_i8_cache_does_not_change_verdict() -> None:
+# --- S8 ----------------------------------------------------------------------
+def test_s8_cache_does_not_change_verdict() -> None:
     clear_cache()
     first = evaluate("e-1")
     second = evaluate("e-1")

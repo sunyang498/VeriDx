@@ -24,7 +24,7 @@
 
 M17（沙箱拒绝率）的口径必须**一处定义、多处引用**。历史上有三种算法并存（按 verdict 数、
 按 reason 数、按样本分组数），必然漂移。现在只有这一个常量，测试会断言
-`CAPABILITY_REASONS == I4 的 rejected 原因集`。
+`CAPABILITY_REASONS == S4 的 rejected 原因集`。
 """
 
 from __future__ import annotations

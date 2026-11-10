@@ -240,7 +240,7 @@ def test_complex_literal_normalized(literal: str, normalized: str) -> None:
 
 
 def test_complex_literal_and_explicit_form_agree() -> None:
-    """I5：同一数学对象的两种写法必须同 verdict、同值。"""
+    """S5：同一数学对象的两种写法必须同 verdict、同值。"""
     from_literal = evaluate("1j", use_cache=False)
     from_explicit = evaluate("1*I", use_cache=False)
     assert from_literal.verdict is from_explicit.verdict is Verdict.UNSUPPORTED

@@ -1,7 +1,7 @@
 """P1.3 验收：Provider 抽象 + 事件循环不被阻塞 + SSE 心跳不断。
 
 关键一条（审查 §8.6）：**并发 3 个慢请求时 SSE 心跳不断** ——
-而且用**保留的 P1 缺陷**（常量表达式绕过指数上限 → 超时 3–4s）去制造真实慢请求，
+而且用**保留的 R1 缺陷**（常量表达式绕过指数上限 → 超时 3–4s）去制造真实慢请求，
 不是造一个 mock 慢接口。这是那条缺陷作为基线素材的第一个正面用途。
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -69,6 +70,61 @@ def test_factory_real_mode_without_key_is_loud(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(config, "API_KEY", "")
     with pytest.raises(ProviderConfigError):
         build_provider()
+
+
+# --- 🟡F1：auto 静默 mock 必须可观察、可禁止 -------------------------------
+def test_require_real_llm_makes_auto_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "LLM_MODE", "auto")
+    monkeypatch.setattr(config, "API_KEY", "")
+    monkeypatch.setattr(config, "REQUIRE_REAL_LLM", True)
+    with pytest.raises(ProviderConfigError, match="需要 key"):
+        build_provider()
+
+
+def test_effective_mode_exposes_the_real_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    from veridx.llm import factory
+
+    monkeypatch.setattr(config, "LLM_MODE", "auto")
+    monkeypatch.setattr(config, "API_KEY", "")
+    monkeypatch.setattr(config, "REQUIRE_REAL_LLM", False)
+    assert factory.effective_mode("primary") == "mock"
+
+    monkeypatch.setattr(config, "API_KEY", SECRET)
+    monkeypatch.setattr(config, "MODEL", "some-model")
+    assert factory.effective_mode("primary") == "real"
+
+    monkeypatch.setattr(config, "REQUIRE_REAL_LLM", True)
+    monkeypatch.setattr(config, "API_KEY", "")
+    assert factory.effective_mode("primary") == "unavailable"
+
+
+def test_second_role_uses_its_own_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """第二模型有独立开关（`LLM_MODE_KIMI`），不能被主模型的 mock 拖下水。"""
+    monkeypatch.setattr(config, "LLM_MODE", "mock")
+    monkeypatch.setattr(config, "SECOND_MODE", "real")
+    monkeypatch.setattr(config, "SECOND_MODEL", "kimi-probe")
+    monkeypatch.setattr(config, "SECOND_API_KEY", SECRET)
+    monkeypatch.setattr(config, "SECOND_BASE_URL", "https://api.moonshot.cn/v1")
+    monkeypatch.setattr(config, "REQUIRE_REAL_LLM", False)
+    provider = build_provider(role="second")
+    assert isinstance(provider, OpenAICompatProvider)
+    assert provider.model == "kimi-probe"
+
+
+def test_health_reports_effective_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from veridx.api.app import create_app
+
+    monkeypatch.setattr(config, "LLM_MODE", "auto")
+    monkeypatch.setattr(config, "API_KEY", "")
+    monkeypatch.setattr(config, "REQUIRE_REAL_LLM", False)
+    with TestClient(create_app(db_path=tmp_path / "health.db")) as client:
+        body = client.get("/api/v1/health").json()
+    assert body["provider"]["mode"] == "auto"
+    assert body["provider"]["effective_mode"] == "mock", "配置说 auto，实际是 mock —— 必须能看见"
+    assert body["status"] == "degraded"
+    assert body["provider"]["require_real_llm"] is False
 
 
 # --- HTTP 层：重试只为可重试错误 -------------------------------------------
@@ -159,7 +215,7 @@ async def test_run_blocking_does_not_block_loop() -> None:
 
 
 async def test_slow_sandbox_calls_do_not_starve_the_loop() -> None:
-    """用保留的 P1 缺陷制造真实慢请求（常量表达式绕过指数上限 → 超时）。"""
+    """用保留的 R1 缺陷制造真实慢请求（常量表达式绕过指数上限 → 超时）。"""
     slow = "10**(3*3*3*3*3*3*3*3*3*3)"
     ticks = 0
 

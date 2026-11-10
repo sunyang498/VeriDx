@@ -143,9 +143,17 @@ TOLERANT_PARSE_MAX_CHARS = 8192
 #: 落 trace 的原始坏文本最多保留多少字符（超出的只存 sha1，见 trace/secrets）
 RAW_TEXT_KEEP_CHARS = 2000
 
-SECOND_MODEL = os.getenv("SECOND_MODEL", "").strip()
-SECOND_BASE_URL = os.getenv("SECOND_BASE_URL", "").strip()
-SECOND_API_KEY = os.getenv("SECOND_API_KEY", "").strip()
+SECOND_MODEL = (os.getenv("SECOND_MODEL") or os.getenv("MODEL_KIMI") or "").strip()
+SECOND_BASE_URL = (os.getenv("SECOND_BASE_URL") or os.getenv("BASE_KIMI_URL") or "").strip()
+SECOND_API_KEY = (os.getenv("SECOND_API_KEY") or os.getenv("API_KIMI_KEY") or "").strip()
+SECOND_MODE = os.getenv("LLM_MODE_KIMI", "auto").strip()
+SECOND_TEMPERATURE = float(
+    os.getenv("SECOND_TEMPERATURE") or os.getenv("TEMPERATURE_KIMI") or DEFAULT_TEMPERATURE
+)
+
+#: fail-closed：公网部署必须显式要求真实模型；`auto` 静默退化 mock 会让"演示完全正常"
+#: 但一句模型都没调（P1.3 审查 🟡F1）
+REQUIRE_REAL_LLM = os.getenv("VERIDX_REQUIRE_REAL_LLM", "").strip().lower() in {"1", "true", "yes"}
 
 _PLACEHOLDERS = {"", "your-api-key", "填写你的key", "sk-xxx"}
 

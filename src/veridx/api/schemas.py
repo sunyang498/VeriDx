@@ -193,7 +193,7 @@ class CancelOut(BaseModel):
 # ---------------------------------------------------------------------------
 class Hypothesis(BaseModel):
     label: str
-    confidence: float = Field(ge=0, le=1)
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
 
 
 class ExplanationStepOut(BaseModel):
@@ -233,7 +233,7 @@ class DiagnosisOut(BaseModel):
     root_cause: str | None = None
     hypotheses: list[Hypothesis] = Field(default_factory=list)
     kp_ids: list[str] = Field(default_factory=list)
-    confidence: float | None = Field(default=None, ge=0, le=1)
+    confidence: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     needs_review: bool = False
 
     claims: list[Claim] = Field(default_factory=list)
@@ -335,9 +335,14 @@ class EvalReportOut(BaseModel):
 # ---------------------------------------------------------------------------
 class ProviderHealth(BaseModel):
     mode: str
+    #: 工厂真实落地的模式：real / mock / unavailable（配置与落地不一致时必须能看见）
+    effective_mode: str = "mock"
     model: str
     reachable: bool | None = None
     second_model: str | None = None
+    second_effective_mode: str | None = None
+    #: 设了 `VERIDX_REQUIRE_REAL_LLM=1` 时，`auto` 不再静默退化为 mock
+    require_real_llm: bool = False
 
 
 class HealthOut(BaseModel):

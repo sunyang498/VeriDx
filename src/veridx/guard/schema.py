@@ -7,20 +7,39 @@
    而**"错"与"绕过"是同一件事**。
 2. **宽容解析的唯一合法目标是"不改值"**。不许全局替换中文引号：
    `"a": "他说“好”"` 里的中文引号是**内容**，替换就改了值。
-   只在**结构位置**（不在任何 ASCII 双引号字符串内）替换。
-3. **永不抛异常**。失败一律返回带 `errors` 的结果——与 `evaluate()` 的 I3 同一条不变量。
+   只在**结构位置**（不在任何字符串内）替换。
+3. **永不抛异常**。失败一律返回带 `errors` 的结果——与 `evaluate()` 的 S3 同一条不变量。
+
+## 引号族（P1.3 审查 🟠A / 🟡D）
+
+`_scan` 同时跟踪四种引号族：ASCII 双引号、ASCII 单引号、中文双引号 `“”`、中文单引号 `‘’`。
+同一时刻只有**一个**"当前字符串族"，因此别的族的引号落在字符串内时只是内容。
+
+* 中文引号没有转义机制，**同形重入**（`“a“b””`）意味着边界不可判 →
+  报 `ambiguous_quotes` + `ambiguous=True`，**不许取第一种解释**。
+* ASCII 单引号与中文引号只有处在**结构位置**（行首或紧跟 `{ [ , : (` 或空白）才算开引号，
+  否则 `It's done` 这类正文会把后面整段吞进"字符串"。
+
+## 不静默丢值（P1.3 审查 🟠B / 🟠C）
+
+`json.loads` 的默认行为有两处会**悄悄改语义**：
+
+* 重复键取最后一个值（模型自相矛盾时被抹平）
+* 接受 `NaN` / `Infinity` / `-Infinity`（下游 pydantic 拿到非有限数）
+
+两者都是**终局判定**，报 `duplicate_key:<key>` / `non_finite:<literal>` 并停止后续"洗"。
 
 ## 有序候选（命中即停，不"再猜一次"）
 
 | 步 | 处理 | 对应分类 |
 |---|---|---|
-| 1 | 原文 `json.loads` | 干净 JSON |
-| 2 | 剥 ```` ```json ```` / ```` ``` ```` 围栏 | F1 |
-| 3 | 截取最外层平衡 `{}` / `[]`（**按字符串状态机扫描**，不是正则） | F2 / F10 |
-| 4 | 去尾逗号（同样在字符串外） | F3 |
-| 5 | 结构位置的中文引号 → ASCII | F5（**绝不动 F6 的值内部**） |
-| 6 | 单引号对象 → `ast.literal_eval` | F4 |
-| 7 | 双重编码：`"{\\"a\\":1}"` 解一层再解 | F8 |
+| 1 | 原文 | — |
+| 2 | 剥 ```` ``` ```` 围栏 | F1 |
+| 3 | 截取最外层平衡片段 | F2 / F10 |
+| 4 | 去尾逗号 | F3 |
+| 5 | 结构位置中文引号 → ASCII | F5 |
+| 6 | 单引号对象（`literal_eval`） | F4 / F6 |
+| 7 | 双重编码解一层 | F8 |
 """
 
 from __future__ import annotations
@@ -34,10 +53,23 @@ from typing import Any
 
 from veridx import config
 
-_FENCE = re.compile(r"^```(?:json|JSON)?\s*\n?(?P<body>.*?)\n?```\s*$", re.S)
+__all__ = ["ParseOutcome", "tolerant_parse"]
 
-#: 中文引号（结构位置替换用）
-_CN_QUOTES = {"“": '"', "”": '"', "‘": "'", "’": "'"}
+_FENCE = re.compile(r"^\s*```[A-Za-z0-9_+-]*\s*\n(?P<body>.*?)(?:\n\s*```\s*)?$", re.DOTALL)
+
+#: 中文引号 → ASCII 双引号（只用于结构位置）
+_CN_QUOTES = {"“": '"', "”": '"', "‘": '"', "’": '"'}
+
+#: 各引号族：开 → (闭, 族名, 是否支持反斜杠转义)
+_QUOTE_FAMILY: dict[str, tuple[str, str, bool]] = {
+    '"': ('"', "ascii", True),
+    "'": ("'", "ascii", True),
+    "“": ("”", "cn", False),
+    "‘": ("’", "cn", False),
+}
+
+#: 非标准引号只有紧跟这些字符（或位于行首）才算开引号
+_OPENER_CONTEXT = frozenset(" \t\r\n{[,(:")
 
 
 @dataclass
@@ -46,7 +78,7 @@ class ParseOutcome:
     errors: list[str] = field(default_factory=list)
     #: 走过哪些修复步骤（审计用；空 = 原文即合法）
     transformations: list[str] = field(default_factory=list)
-    #: 出现了多个顶层 JSON 时置 True（取第一个，**不合并**）
+    #: 有歧义时置 True：多个顶层 JSON（取第一个），或同形引号嵌套（直接失败）
     ambiguous: bool = False
     #: 原文摘要（脱敏后由调用方决定存不存全文）
     source_sha: str = ""
@@ -78,11 +110,17 @@ def _parse(text: object, max_chars: int) -> ParseOutcome:
     outcome = ParseOutcome(source_sha=source_sha)
 
     # 1 原文
-    direct = _try_json(stripped)
+    direct, fatal = _try_json(stripped)
+    if fatal is not None:
+        outcome.errors.append(fatal)
+        return outcome
     if direct is not None:
         if isinstance(direct, str):
             # 双重编码（F8）：`"{\"a\":1}"` —— 解一层字符串再解
-            nested = _try_json(direct.strip())
+            nested, nested_fatal = _try_json(direct.strip())
+            if nested_fatal is not None:
+                outcome.errors.append(nested_fatal)
+                return outcome
             if isinstance(nested, (dict, list)):
                 outcome.transformations.append("double_decode")
                 return _finish(outcome, nested)
@@ -93,7 +131,10 @@ def _parse(text: object, max_chars: int) -> ParseOutcome:
     if fenced:
         outcome.transformations.append("strip_fence")
         body = fenced.group("body").strip()
-        direct = _try_json(body)
+        direct, fatal = _try_json(body)
+        if fatal is not None:
+            outcome.errors.append(fatal)
+            return outcome
         if direct is not None:
             return _finish(outcome, direct)
         stripped = body
@@ -103,7 +144,10 @@ def _parse(text: object, max_chars: int) -> ParseOutcome:
     if extracted is not None and extracted != stripped:
         outcome.transformations.append("extract_outermost")
         outcome.ambiguous = ambiguous
-        direct = _try_json(extracted)
+        direct, fatal = _try_json(extracted)
+        if fatal is not None:
+            outcome.errors.append(fatal)
+            return outcome
         if direct is not None:
             return _finish(outcome, direct)
         stripped = extracted
@@ -112,16 +156,28 @@ def _parse(text: object, max_chars: int) -> ParseOutcome:
     no_trailing = _strip_trailing_commas(stripped)
     if no_trailing != stripped:
         outcome.transformations.append("strip_trailing_comma")
-        direct = _try_json(no_trailing)
+        direct, fatal = _try_json(no_trailing)
+        if fatal is not None:
+            outcome.errors.append(fatal)
+            return outcome
         if direct is not None:
             return _finish(outcome, direct)
         stripped = no_trailing
 
     # 5 结构位置的中文引号（F5；F6 的值内部不动）
+    _, ambiguous_quotes = _scan(stripped)
+    if ambiguous_quotes:
+        # 同形引号嵌套：任何"标准化"都是猜测
+        outcome.ambiguous = True
+        outcome.errors.append("ambiguous_quotes")
+        return outcome
     ascii_quoted = _normalize_structural_quotes(stripped)
     if ascii_quoted != stripped:
         outcome.transformations.append("normalize_structural_quotes")
-        direct = _try_json(ascii_quoted)
+        direct, fatal = _try_json(ascii_quoted)
+        if fatal is not None:
+            outcome.errors.append(fatal)
+            return outcome
         if direct is not None:
             return _finish(outcome, direct)
         stripped = ascii_quoted
@@ -131,6 +187,11 @@ def _parse(text: object, max_chars: int) -> ParseOutcome:
         literal = _try_literal_eval(stripped)
         if literal is not None:
             outcome.transformations.append("literal_eval")
+            normalized, fatal = _try_json(json.dumps(literal, ensure_ascii=False))
+            if fatal is not None:
+                outcome.errors.append(fatal)
+                return outcome
+            del normalized
             return _finish(outcome, literal)
 
     # 7 双重编码（F8）
@@ -151,11 +212,43 @@ def _finish(outcome: ParseOutcome, value: Any) -> ParseOutcome:
     return outcome
 
 
-def _try_json(text: str) -> Any | None:
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non_finite:{name}")
+
+
+def _try_json(text: str) -> tuple[Any, str | None]:
+    """严格 JSON：拒非有限数、拒重复键。
+
+    返回 ``(value, fatal)``：
+
+    * ``fatal is None`` 且 ``value is None`` → 只是不合法 JSON（后续步骤可以继续洗）
+    * ``fatal`` 非空 → 终局判定（``non_finite:*`` / ``duplicate_key:*``），必须终止
+    """
+    duplicates: list[str] = []
+
+    def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, val in pairs:
+            if key in out:
+                duplicates.append(key)
+            out[key] = val
+        return out
+
     try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError, RecursionError):
-        return None
+        value = json.loads(text, object_pairs_hook=hook, parse_constant=_reject_constant)
+    except json.JSONDecodeError:
+        return None, None
+    except ValueError as exc:
+        message = str(exc)
+        if message.startswith("non_finite:"):
+            return None, message
+        return None, None
+    except RecursionError:
+        return None, None
+    if duplicates:
+        # 静默取最后一个值会掩盖模型自相矛盾（审查 🟠B）
+        return None, f"duplicate_key:{duplicates[0]}"
+    return value, None
 
 
 def _try_literal_eval(text: str) -> Any | None:
@@ -167,42 +260,71 @@ def _try_literal_eval(text: str) -> Any | None:
 
 
 def _try_double_encoded(text: str) -> Any | None:
-    inner = _try_json(text)
+    inner, _ = _try_json(text)
     if not isinstance(inner, str):
         return None
-    return _try_json(inner.strip())
+    value, fatal = _try_json(inner.strip())
+    return None if fatal is not None else value
 
 
 def _sha(text: object) -> str:
     return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def _scan(text: str) -> list[tuple[int, bool]]:
-    """把文本按"是否在 ASCII 双引号字符串内"标注每个字符的状态。
+def _can_open(text: str, index: int, char: str) -> bool:
+    """非标准引号（单引号 / 中文引号）只在结构位置才算开引号。"""
+    if char == '"':
+        return True
+    return index == 0 or text[index - 1] in _OPENER_CONTEXT
+
+
+def _scan(text: str) -> tuple[list[tuple[int, bool]], bool]:
+    """标注每个字符是否在字符串内，并报告中文引号同形嵌套。
 
     这是 F5/F6 能用同一份逻辑的前提：**只有 `in_string=False` 的位置才允许改引号**。
     正确处理反斜杠转义（`\\"` 不算结束符）。
     """
     states: list[tuple[int, bool]] = []
-    in_string = False
+    family: str | None = None
+    closer = ""
+    backslash = False
     escaped = False
+    ambiguous = False
+
     for index, char in enumerate(text):
-        states.append((index, in_string))
-        if in_string:
-            if escaped:
+        if family is None:
+            states.append((index, False))
+            opened = _QUOTE_FAMILY.get(char)
+            if opened is not None and _can_open(text, index, char):
+                closer, family, backslash = opened
                 escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-        elif char == '"':
-            in_string = True
-    return states
+            continue
+        if escaped:
+            states.append((index, True))
+            escaped = False
+            continue
+        if backslash and char == "\\":
+            states.append((index, True))
+            escaped = True
+            continue
+        if char == closer:
+            # 闭引号视为结构位置（可被 F5 标准化）
+            states.append((index, False))
+            family = None
+            closer = ""
+            backslash = False
+            continue
+        states.append((index, True))
+        if family == "cn" and char in _CN_QUOTES:
+            # 中文引号无转义、无方向冗余：同形重入即边界不可判（审查 🟠A）
+            ambiguous = True
+
+    return states, ambiguous
 
 
 def _extract_outermost(text: str) -> tuple[str | None, bool]:
     """找到第一个平衡的 `{...}` 或 `[...]`（字符串感知），并判断后面是否还有第二个。"""
-    states = dict(_scan(text))
+    states = dict(_scan(text)[0])
     start = None
     opener = ""
     depth = 0
@@ -231,7 +353,7 @@ def _extract_outermost(text: str) -> tuple[str | None, bool]:
 
 
 def _strip_trailing_commas(text: str) -> str:
-    states = dict(_scan(text))
+    states = dict(_scan(text)[0])
     out: list[str] = []
     for index, char in enumerate(text):
         if char == "," and not states.get(index, False):
@@ -244,13 +366,12 @@ def _strip_trailing_commas(text: str) -> str:
 
 def _normalize_structural_quotes(text: str) -> str:
     """只替换**字符串外**的中文引号（F5）；值内部的（F6）逐字节保留。"""
-    states = dict(_scan(text))
+    states = dict(_scan(text)[0])
     out = []
     for index, char in enumerate(text):
         if char in _CN_QUOTES and not states.get(index, False):
-            replacement = _CN_QUOTES[char]
-            # 中文单引号不替换成 ASCII 单引号（会破坏 Python 里的 `'` 语义），只换成双引号更稳
-            out.append('"' if replacement == "'" else replacement)
+            # 中文单引号统一换成 ASCII 双引号：换成 `'` 会破坏后续 literal_eval 语义
+            out.append('"')
         else:
             out.append(char)
     return "".join(out)

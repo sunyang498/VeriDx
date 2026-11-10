@@ -20,6 +20,45 @@ class ProviderConfigError(RuntimeError):
     pass
 
 
+def _settings_for(role: str) -> tuple[str, str, str, str]:
+    """返回 ``(mode, model, base_url, api_key)``；`role` 决定用哪一组（审查 🟡F1）。"""
+    if role == "second":
+        return (
+            config.SECOND_MODE or config.LLM_MODE,
+            config.SECOND_MODEL,
+            config.SECOND_BASE_URL,
+            config.SECOND_API_KEY,
+        )
+    return config.LLM_MODE, config.MODEL, config.BASE_URL, config.API_KEY
+
+
+def resolve_mode(*, role: str = "primary", mode: str | None = None) -> str:
+    """把 `auto` 落地成 `real` / `mock`，并让 `REQUIRE_REAL_LLM` 能 fail-closed。
+
+    `auto` 静默退化为 mock 会让"评测跑的是真模型"变成一句无法验证的声明，
+    所以给出这道硬开关：设了 `VERIDX_REQUIRE_REAL_LLM=1` 就必须真调。
+    """
+    configured, model, _base_url, api_key = _settings_for(role)
+    requested = (mode or configured or "auto").lower()
+    if requested not in {"auto", "real", "mock"}:
+        raise ProviderConfigError(f"未知 LLM 模式：{requested}")
+    if requested == "mock":
+        return "mock"
+    if config.has_key(api_key or "") and bool(model):
+        return "real"
+    if requested == "real" or config.REQUIRE_REAL_LLM:
+        raise ProviderConfigError(f"{role} provider 需要 key，但配置为空（LLM_MODE={requested}）")
+    return "mock"
+
+
+def effective_mode(role: str = "primary") -> str:
+    """健康检查用：不抛异常，拿不到真模型时报 `unavailable`。"""
+    try:
+        return resolve_mode(role=role)
+    except ProviderConfigError:
+        return "unavailable"
+
+
 def build_provider(
     *,
     role: str = "primary",
@@ -28,18 +67,10 @@ def build_provider(
     transport: Any = None,
 ) -> LLMProvider:
     """构造 provider。`role="second"` 走第二模型（分支 B 闸 2 / judge）。"""
-    resolved_mode = (mode or config.LLM_MODE).lower()
-
-    model = config.MODEL if role == "primary" else config.SECOND_MODEL
-    base_url = config.BASE_URL if role == "primary" else config.SECOND_BASE_URL
-    api_key = config.API_KEY if role == "primary" else config.SECOND_API_KEY
-    has_key = config.has_key(api_key or "") and bool(model)
+    resolved_mode = resolve_mode(role=role, mode=mode)
+    _mode, model, base_url, api_key = _settings_for(role)
 
     if resolved_mode == "mock":
-        return MockProvider(responses=list(responses or []), model=f"mock-{role}")
-    if resolved_mode == "real" and not has_key:
-        raise ProviderConfigError(f"{role} provider 需要 key，但配置为空（LLM_MODE=real）")
-    if not has_key:
         return MockProvider(responses=list(responses or []), model=f"mock-{role}")
 
     return OpenAICompatProvider(
@@ -51,4 +82,4 @@ def build_provider(
     )
 
 
-__all__ = ["ProviderConfigError", "build_provider"]
+__all__ = ["ProviderConfigError", "build_provider", "effective_mode", "resolve_mode"]
