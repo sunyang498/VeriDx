@@ -56,7 +56,7 @@ from veridx.guard.evidence import (
 from veridx.guard.structured import Budget, StructuredOutputError, call_structured
 from veridx.llm.base import LLMProvider
 from veridx.prompts import diagnose as diagnose_prompt
-from veridx.sandbox import Verdict, evaluate
+from veridx.sandbox import Verdict, compare, evaluate
 from veridx.store.repository import Repository
 from veridx.taxonomy import ErrorType
 from veridx.tools.context import ToolContext
@@ -132,6 +132,18 @@ class RunResult:
     notes: list[str] = field(default_factory=list)
 
 
+def _brief(value: str | list[str], limit: int = 200) -> str | list[str]:
+    """trace 里的 claim 值留档：短值原样，长值截断（原文不入库，避免 trace 膨胀）。"""
+    if isinstance(value, list):
+        return [item[:limit] for item in value]
+    return value[:limit]
+
+
+def _was_accepted(decision: BindingDecision, item: ClaimWithSeq) -> bool:
+    verdict = next((v for v in decision.verdicts if v.seq == item.seq), None)
+    return bool(verdict and verdict.accepted)
+
+
 class _Done(Exception):
     """内部信号：终态已确定，中断后续节点。**只有 `_finish` 能抛它。**"""
 
@@ -185,6 +197,7 @@ class Runner:
             draft = await self._node_diagnose(spec)
             claims, decision = self._node_guard(draft, block, item_id=spec.item_id)
             self._check_confidence(draft, decision)
+            self._node_kb(draft.kp_ids, item_id=spec.item_id)
             explanation = await self._node_explain(spec, draft, decision)
             diagnosis = self._node_submit(spec, draft, claims, decision, blind, explanation)
             self._finish(Terminal.DIAGNOSED, None)
@@ -336,11 +349,11 @@ class Runner:
             # 双闸未过时只记 candidate，对外一律"已提交人工复核"，绝不说"答案错"
             self._finish(Terminal.ESCALATED, ReasonCode.SUSPECTED_BAD_ANSWER_KEY.value)
         if outcome.branch is Branch.C_UNCERTAIN:
-            # 判不了 ≠ 判错：能判等但超能力 → sandbox_unsupported；压根没答出来 → schema_invalid
+            # 判不了 ≠ 判错：能判等但超能力 → sandbox_unsupported；压根没答出来 → solve_schema_invalid
             code = (
                 ReasonCode.SANDBOX_UNSUPPORTED
                 if "cannot_parse" in outcome.notes
-                else ReasonCode.SCHEMA_INVALID
+                else ReasonCode.SOLVE_SCHEMA_INVALID
             )
             self._finish(Terminal.UNCERTAIN, code.value)
         if outcome.branch is Branch.D_DISAGREE:
@@ -366,6 +379,22 @@ class Runner:
                 {"model_steps": blind.steps, "student_steps": [spec.student_answer]},
                 self.ctx,
             )
+
+    def _node_kb(self, kp_ids: list[str], *, item_id: str | None) -> None:
+        """诊断后查表校验知识点（产 `kb_lookup` 证据 + 建 kp_links）。
+
+        注意：这一步的证据 `seq` 必然大于 claim 占号 —— 所以**不能**用它的证据去支撑
+        已经发过号的 claim（E4 会拒）。它在流水线里的位置只用于"落库与关联"。
+        """
+        if not kp_ids or self.conn is None:
+            return
+        observation = dispatch(ToolName.KB_LOOKUP, {"kp_ids": kp_ids}, self.ctx)
+        self.tracer.event(
+            NodeName.KB_LOOKUP.value,
+            status=NodeStatus.OK if observation.get("status") == "ok" else NodeStatus.SKIPPED,
+            detail={k: v for k, v in observation.items() if k != "found"},
+            item_id=item_id,
+        )
 
     # ---- 节点 4：claim 占号 + diagnose -----------------------------------
     def _reserve_claim_block(self) -> ClaimSeqBlock:
@@ -397,7 +426,7 @@ class Runner:
             )
         except StructuredOutputError as exc:
             self.notes.append(f"diagnose_failed:{exc.errors[:2]}")
-            self._finish(Terminal.ESCALATED, ReasonCode.SCHEMA_INVALID.value)
+            self._finish(Terminal.ESCALATED, ReasonCode.DIAGNOSE_SCHEMA_INVALID.value)
         self._spend(result.usage_total)
         return result.model if isinstance(result.model, DiagnoseDraft) else DiagnoseDraft(**result.data)
 
@@ -421,7 +450,7 @@ class Runner:
                 seq = block.take()
             except IndexError:
                 self.notes.append("too_many_claims")
-                self._finish(Terminal.ESCALATED, ReasonCode.SCHEMA_INVALID.value)
+                self._finish(Terminal.ESCALATED, ReasonCode.DIAGNOSE_SCHEMA_INVALID.value)
             claims.append(ClaimWithSeq(claim=claim, seq=seq))
 
         decision = bind_claims(run_id=self.run_id, claims=claims, ledger=self._ledger())
@@ -453,6 +482,18 @@ class Runner:
                 "needs_review": decision.needs_review,
                 "claim_seqs": [item.seq for item in claims],
                 "evidence_seqs": [entry.evidence.seq for entry in self._ledger()],
+                # 审查 🟡G：escalated 不写 diagnoses 行，M5（证据绑定通过率）与 F3/F4
+                # 细分必须能从 trace 重算 —— 所以 claims 的内容也要落 trace
+                "claims": [
+                    {
+                        "field": item.claim.field.value,
+                        "value": _brief(item.claim.value),
+                        "evidence_ids": list(item.claim.evidence_ids),
+                        "seq": item.seq,
+                        "accepted": _was_accepted(decision, item),
+                    }
+                    for item in claims
+                ],
             },
             item_id=item_id,
         )
@@ -505,15 +546,32 @@ class Runner:
         return explanation
 
     def _verify_step(self, expr: str) -> bool | None:
-        """讲解步骤的复核：**可求值且有限**才算"可验证"（不是"这一步正确"）。"""
-        result = evaluate(expr, symbols=self.ctx.symbols)
+        """讲解步骤的复核。
+
+        支持两种写法：
+        * `A == B` → 用 `compare` 判等（**这是模型最自然的写法**，直接丢给沙箱会得到
+          `unsupported_node:Compare`，于是"可验证"永远降级成"教学性表述"）；
+        * 纯表达式 → 能求值且结果有限即算通过。
+
+        语义仍是"这一步的数学结论可被程序核验"，**不是**"这一步是对的"。
+        """
+        text = expr.strip()
+        left, _, right = text.partition("==")
+        if right.strip():
+            comparison = compare(left.strip(), right.strip(), symbols=self.ctx.symbols)
+            passed = comparison.equal is True
+            payload: dict[str, object] = {"expr": text, "equal": comparison.equal}
+        else:
+            result = evaluate(text, symbols=self.ctx.symbols)
+            passed = result.verdict is Verdict.OK
+            payload = {"expr": text, "verdict": result.verdict.value, "reason": result.reason}
         self.ctx.record_evidence(
             kind="numeric_check",
-            payload={"expr": expr, "verdict": result.verdict.value, "reason": result.reason},
+            payload=payload,
             produced_by=NodeName.EXPLAIN.value,
-            status="ok" if result.verdict is Verdict.OK else "skipped",
+            status="ok" if passed else "skipped",
         )
-        return True if result.verdict is Verdict.OK else None
+        return True if passed else None
 
     # ---- 节点 7：submit ---------------------------------------------------
     def _node_submit(

@@ -45,8 +45,10 @@ from veridx.guard.claim import (
     EvidenceStatus,
 )
 from veridx.taxonomy import READING_SUBTYPES, ErrorType
+from veridx.trace.event import ReasonCode
 
 __all__ = [
+    "JUSTIFIED_ESCALATION_REASONS",
     "BindingDecision",
     "ClaimSeqBlock",
     "ClaimVerdict",
@@ -56,7 +58,9 @@ __all__ = [
     "OverEscalationReport",
     "allocate_claim",
     "bind_claims",
+    "capability_gap",
     "over_escalation",
+    "over_escalation_from_outcomes",
     "reserve_claim_seqs",
 ]
 
@@ -218,10 +222,11 @@ def bind_claims(
 
     # 第二遍：E3（档位判定 —— 由**证据**触发，不由模型声明触发）
     subtype = _structurally_valid_subtype(claims, verdicts)
+    declared_type = _structurally_valid_error_type(claims, verdicts)
     for position, verdict in enumerate(verdicts):
         referenced = referenced_by[position]
         if referenced:
-            _check_class(verdict, referenced, subtype=subtype)
+            _check_class(verdict, referenced, subtype=subtype, declared_type=declared_type)
 
     caps = [
         EVIDENCE_CONFIDENCE_CAP[entry.evidence.kind]
@@ -253,6 +258,21 @@ def _structurally_valid_subtype(
     """只取"通过 E1/E2/E4"的 `error_subtype` 值。立不住的 subtype 不参与档位判定。"""
     for item, verdict in zip(claims, verdicts, strict=True):
         if item.claim.field is not ClaimField.ERROR_SUBTYPE:
+            continue
+        if not verdict.accepted:
+            continue
+        raw = item.claim.value
+        if isinstance(raw, str):
+            return raw.strip()
+    return None
+
+
+def _structurally_valid_error_type(
+    claims: Sequence[ClaimWithSeq], verdicts: Sequence[ClaimVerdict]
+) -> str | None:
+    """只取"通过 E1/E2/E4"的 `error_type` 值（用于校验字段组合是否自洽）。"""
+    for item, verdict in zip(claims, verdicts, strict=True):
+        if item.claim.field is not ClaimField.ERROR_TYPE:
             continue
         if not verdict.accepted:
             continue
@@ -313,10 +333,11 @@ def _check_class(
     referenced: list[LedgerEntry],
     *,
     subtype: str | None,
+    declared_type: str | None = None,
 ) -> None:
     """E3：证据类别要撑得起这个字段（档位**由证据触发**，见 `_class_ok`）。"""
     kinds = {entry.evidence.kind for entry in referenced}
-    if _class_ok(verdict.claim, kinds, subtype):
+    if _class_ok(verdict.claim, kinds, subtype, declared_type):
         return
     verdict.violations.append(BindingViolation.EVIDENCE_CLASS_MISMATCH)
     verdict.detail.append(
@@ -325,32 +346,50 @@ def _check_class(
     )
 
 
-def _class_ok(claim: Claim, kinds: set[EvidenceKind], subtype: str | None) -> bool:
+def _class_ok(
+    claim: Claim,
+    kinds: set[EvidenceKind],
+    subtype: str | None,
+    declared_type: str | None = None,
+) -> bool:
     """E3 唯一判据。**放宽只由"引用了 condition_check 证据"触发**（ADR-021）。
 
     | 字段 | 判据 |
     |---|---|
     | `kp_ids` | 必须引用 `kb_lookup` |
     | `first_divergent_step` | 必须引用 `step_diff` |
-    | `root_cause` / `error_subtype` | **永远**要强程序证据（不随 `error_type` 放宽） |
-    | `error_type=审题性错误` | 强程序证据，或（实际引用了 `condition_check` **且** 子类在预枚举审题类内） |
+    | `root_cause` | **永远**要强程序证据（自由文本，最容易被编） |
+    | `error_subtype` | 与 `error_type` **同档**：强证据，或（值在预枚举审题类内 + 有 `condition_check`） |
+    | `error_type=审题性错误` | 强证据，或（有 `condition_check` + 子类在预枚举审题类内） |
     | `error_type=其他` | `student_text` + 任意 1 条其他证据（§3.3.3 第三档） |
     | 其余 | 强程序证据 |
+
+    > **纪律（v3.5）**：严格度取决于**取值空间**。自由文本（`root_cause`）要强证据；
+    > 枚举/有限集字段（`error_subtype`）"在集合内"本身就是强约束。
+    > 对枚举字段套自由文本的严格度，代价是**指标分辨率归零**（上一版正是如此：
+    > 要放宽 `error_type` 必须给 `error_subtype`，而 `error_subtype` 自己永远被拒）。
     """
     strong = bool(kinds & STRONG_EVIDENCE_KINDS)
+    has_condition = EvidenceKind.CONDITION_CHECK in kinds
 
     if claim.field is ClaimField.KP_IDS:
         return bool(kinds & LOOKUP_KINDS)
     if claim.field is ClaimField.FIRST_DIVERGENT_STEP:
         return bool(kinds & STEP_FIELD_KINDS)
-    if claim.field in {ClaimField.ROOT_CAUSE, ClaimField.ERROR_SUBTYPE}:
+    if claim.field is ClaimField.ROOT_CAUSE:
         return strong
+    if claim.field is ClaimField.ERROR_SUBTYPE:
+        own = claim.value if isinstance(claim.value, str) else ""
+        # 自身值在枚举内 + 有半程序证据；且（若声明了 error_type）该大类必须是审题性，
+        # 否则就是"程序性错误 + 审题类子类"这种自相矛盾的组合，不给过。
+        coherent = declared_type in (None, ErrorType.READING.value)
+        return strong or (has_condition and coherent and own.strip() in READING_SUBTYPES)
     if claim.field is not ClaimField.ERROR_TYPE:
         return strong
 
     declared = claim.value if isinstance(claim.value, str) else ""
     if declared == ErrorType.READING.value:
-        relaxed = EvidenceKind.CONDITION_CHECK in kinds and subtype in READING_SUBTYPES
+        relaxed = has_condition and subtype in READING_SUBTYPES
         return strong or relaxed
     if declared == ErrorType.OTHER.value:
         return bool(kinds & TEXT_KINDS) and len(kinds - TEXT_KINDS) >= 1
@@ -362,11 +401,15 @@ def _required_label(claim: Claim, subtype: str | None) -> list[str]:
         return ["kb_lookup"]
     if claim.field is ClaimField.FIRST_DIVERGENT_STEP:
         return ["step_diff"]
+    if claim.field is ClaimField.ROOT_CAUSE:
+        return ["numeric_check|step_diff（自由文本，永不放宽）"]
+    if claim.field is ClaimField.ERROR_SUBTYPE:
+        return ["numeric_check|step_diff", "或 condition_check + 子类在预枚举审题类内"]
     declared = claim.value if isinstance(claim.value, str) else ""
     if claim.field is ClaimField.ERROR_TYPE and declared == ErrorType.READING.value:
         allowed = subtype in READING_SUBTYPES
         return (
-            ["numeric_check|step_diff"] + (["condition_check"] if allowed else [])
+            ["numeric_check|step_diff", "condition_check（已声明预枚举审题子类）"]
             if allowed
             else ["numeric_check|step_diff（未声明预枚举审题子类，不放宽）"]
         )
@@ -444,11 +487,30 @@ def _is_capability_gap(evidence: Evidence) -> bool:
 
 @dataclass
 class OverEscalationReport:
-    """两个分母分开报（审查 §6.2）：机制性 / 能力性。"""
+    """两个分母分开报（审查 §6.2）：机制性 / 能力性。
+
+    ## 分母与分子的口径（审查 P1.6 §6-必2）
+
+    * **分母 = 全部题数**（含 `diagnosed` / `uncertain` / `failed`），
+      不是"跑到 bind_claims 的题数"——那是**另一个总体**；
+    * **分子排除"正确的 escalate"**：`student_answer_correct` / `suspected_bad_answer_key` /
+      `unparsable_*` / `user_canceled` 不是"本可诊断却没诊断"，
+      把它们算进 over-escalation 会与 M18（误判率）**直接打架**；
+    * **三个数分开报**：机制性 / 能力性 / 非过度拒绝，读者不会把它们混成一个比率。
+    """
 
     total: int = 0
     mechanism: int = 0
     capability: int = 0
+    #: 不是"过度拒绝"的 escalate（正确终局 / 调用方问题），单列
+    justified: int = 0
+    diagnosed: int = 0
+    uncertain: int = 0
+    failed: int = 0
+
+    @property
+    def over_escalation_total(self) -> int:
+        return self.mechanism + self.capability
 
     @property
     def mechanism_rate(self) -> float:
@@ -460,7 +522,33 @@ class OverEscalationReport:
 
     @property
     def total_rate(self) -> float:
-        return (self.mechanism + self.capability) / self.total if self.total else 0.0
+        return self.over_escalation_total / self.total if self.total else 0.0
+
+    @property
+    def justified_rate(self) -> float:
+        return self.justified / self.total if self.total else 0.0
+
+    @property
+    def diagnosed_rate(self) -> float:
+        return self.diagnosed / self.total if self.total else 0.0
+
+    def as_dict(self) -> dict[str, float | int]:
+        """报告头要打印的东西（三个比率必须同时出现，避免只报一个合并数）。"""
+        return {
+            "total": self.total,
+            "over_escalation_total": self.over_escalation_total,
+            "over_escalation_rate": round(self.total_rate, 4),
+            "over_escalation_mechanism": self.mechanism,
+            "over_escalation_mechanism_rate": round(self.mechanism_rate, 4),
+            "over_escalation_capability": self.capability,
+            "over_escalation_capability_rate": round(self.capability_rate, 4),
+            "justified_escalation": self.justified,
+            "justified_escalation_rate": round(self.justified_rate, 4),
+            "diagnosed": self.diagnosed,
+            "diagnosis_rate": round(self.diagnosed_rate, 4),
+            "uncertain": self.uncertain,
+            "failed": self.failed,
+        }
 
 
 def capability_gap(ledger: Iterable[LedgerEntry], run_id: str) -> bool:
@@ -469,12 +557,76 @@ def capability_gap(ledger: Iterable[LedgerEntry], run_id: str) -> bool:
 
 
 def over_escalation(decisions: Sequence[BindingDecision]) -> OverEscalationReport:
+    """**只统计跑到 `bind_claims` 的题**（内部诊断用）。
+
+    ⚠️ 这不是对外口径：runner 有 8 条 escalate 路径，只有 E5 经过 `bind_claims`。
+    报告请用 `over_escalation_from_outcomes()`（分母 = 全部题数）。
+    """
     report = OverEscalationReport(total=len(decisions))
     for decision in decisions:
         if not decision.escalate:
+            report.diagnosed += 1
             continue
         if decision.escalation_kind is EscalationKind.CAPABILITY:
             report.capability += 1
         else:
             report.mechanism += 1
     return report
+
+
+#: 这些 reason 的 escalate 是**正确终局或调用方问题**，不算"过度拒绝"。
+JUSTIFIED_ESCALATION_REASONS: frozenset[str] = frozenset(
+    {
+        ReasonCode.STUDENT_ANSWER_CORRECT.value,
+        ReasonCode.SUSPECTED_BAD_ANSWER_KEY.value,
+        ReasonCode.UNPARSABLE_STEM.value,
+        ReasonCode.UNPARSABLE_ANSWER.value,
+        ReasonCode.USER_CANCELED.value,
+    }
+)
+
+
+def over_escalation_from_outcomes(outcomes: Iterable[object]) -> OverEscalationReport:
+    """**对外口径**：分母 = 全部题数，分子排除"正确的 escalate"。
+
+    接受任何带 `terminal` / `reason_code` / `escalation_kind` 三个属性的对象
+    （`flow.runner.RunResult` 即是其一），也接受 dict。
+    """
+    report = OverEscalationReport()
+    for outcome in outcomes:
+        terminal = _field(outcome, "terminal")
+        reason = _field(outcome, "reason_code")
+        kind = _field(outcome, "escalation_kind")
+        terminal_value = getattr(terminal, "value", terminal)
+        reason_value = getattr(reason, "value", reason)
+
+        report.total += 1
+        if terminal_value == "diagnosed":
+            report.diagnosed += 1
+            continue
+        if terminal_value == "uncertain":
+            report.uncertain += 1
+            continue
+        if terminal_value == "failed":
+            report.failed += 1
+            continue
+        if terminal_value != "escalated":
+            continue
+        if reason_value in JUSTIFIED_ESCALATION_REASONS:
+            report.justified += 1
+            continue
+        kind_value = getattr(kind, "value", kind)
+        if kind_value == EscalationKind.CAPABILITY.value:
+            report.capability += 1
+        elif kind_value == EscalationKind.MECHANISM.value:
+            report.mechanism += 1
+        else:
+            # 没标注口径的 escalate 一律算机制性（宁可高估自己的问题，不美化指标）
+            report.mechanism += 1
+    return report
+
+
+def _field(outcome: object, name: str) -> object:
+    if isinstance(outcome, dict):
+        return outcome.get(name)
+    return getattr(outcome, name, None)

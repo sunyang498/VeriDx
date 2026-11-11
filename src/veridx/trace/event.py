@@ -26,6 +26,7 @@ class NodeName(StrEnum):
     BLIND_SOLVE = "blind_solve"
     CHECK_NUMERIC = "check_numeric"
     STEP_DIFF = "step_diff"
+    KB_LOOKUP = "kb_lookup"
     DIAGNOSE = "diagnose"
     EXPLAIN = "explain"
     GUARD = "guard"
@@ -43,6 +44,11 @@ class ReasonCode(StrEnum):
     SANDBOX_UNSUPPORTED = "sandbox_unsupported"
     TOOL_ERROR = "tool_error"
     SCHEMA_INVALID = "schema_invalid"
+    #: C-19（P1.6 审查 🟡C 新增，待登记）：按**阶段**拆开，一个 code 一个含义。
+    #: 原来 `schema_invalid` 同时映射到 escalated 与 uncertain 两种终态，
+    #: 按 reason_code 分组统计时会把两类完全不同的失败混进同一组。
+    DIAGNOSE_SCHEMA_INVALID = "diagnose_schema_invalid"
+    SOLVE_SCHEMA_INVALID = "solve_schema_invalid"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
     LOW_CONFIDENCE = "low_confidence"
     SUSPECTED_BAD_ANSWER_KEY = "suspected_bad_answer_key"

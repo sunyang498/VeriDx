@@ -19,10 +19,29 @@ evidence can be produced, the system escalates instead of guessing.
 
 ## Status
 
-**P0 (contracts frozen at gate G0).** The four contracts — REST, SSE, trace, and
-claim/evidence — are frozen, the database schema is frozen, and the API runs
-end-to-end on stubbed data. The agent core (sandbox, guard, evidence binding,
-control flow) and the evaluation harness land in P1–P4.
+**P1.7 (gate G0.6).** The agent core is real end-to-end: blind solve → program
+verification → claim–evidence binding → step explanation. `POST /diagnose` runs
+the pipeline in the background, streams progress over SSE, and persists a
+diagnosis whose every claim cites program-generated evidence. `step_diff` is
+still a placeholder (P1.8), so non-numeric questions escalate instead of guessing.
+
+## Demo (Web UI)
+
+```bash
+./.venv/Scripts/pip install -e ".[dev]"
+./.venv/Scripts/veridx serve --port 8000     # http://127.0.0.1:8000
+```
+
+The page is served by FastAPI from `web/dist` (same origin, no CORS). Rebuild it
+after editing `web/src`:
+
+```bash
+cd web && npm ci && npm run build
+```
+
+Without any API key the pipeline still runs end-to-end in `LLM_MODE=mock` (a
+scenario provider that answers by prompt type) — useful for offline demos; every
+quality metric, however, must be measured on a real model.
 
 ## Layout
 

@@ -27,7 +27,7 @@ from veridx.guard.claim import BindingViolation, Claim, ClaimField
 from veridx.guard.evidence import ClaimWithSeq, bind_claims
 from veridx.llm.mock import MockProvider
 from veridx.store import db as store_db
-from veridx.store.repository import Repository
+from veridx.store.repository import Repository, RepositoryError
 from veridx.trace.event import ReasonCode
 from veridx.trace.recorder import TraceRecorder
 
@@ -224,11 +224,11 @@ async def test_late_evidence_cannot_support_a_claim() -> None:
 
 
 async def test_model_supplied_seq_is_rejected_by_schema() -> None:
-    """模型自带 `seq` → 整条 claim 不合法 → 回喂重试耗尽 → escalate(schema_invalid)。"""
+    """模型自带 `seq` → 整条 claim 不合法 → 回喂重试耗尽 → escalate(diagnose_schema_invalid)。"""
     primary, second = _providers(*([_diagnose(include_seq=999999)] * 3))
     result, _ = await _run(primary, second)
     assert result.terminal is Terminal.ESCALATED
-    assert result.reason_code == ReasonCode.SCHEMA_INVALID.value
+    assert result.reason_code == ReasonCode.DIAGNOSE_SCHEMA_INVALID.value
 
 
 async def test_explain_evidence_cannot_be_cited_by_claims() -> None:
@@ -427,10 +427,61 @@ async def test_claims_cannot_exceed_reserved_block() -> None:
     primary, second = _providers(many)
     result, _ = await _run(primary, second, limits=RunLimits(max_claims=2))
     assert result.terminal is Terminal.ESCALATED
-    assert result.reason_code == ReasonCode.SCHEMA_INVALID.value
+    assert result.reason_code == ReasonCode.DIAGNOSE_SCHEMA_INVALID.value
 
 
 # --- ⑤ 落库 -------------------------------------------------------------
+def test_n5_non_finite_payload_is_refused_at_storage_layer(conn) -> None:  # noqa: ANN001
+    """N5：`payload` 是自由 dict，不受 `StrictModel` 保护 —— 存储层必须自己拦。"""
+    import math
+
+    repo = Repository(conn)
+    with pytest.raises(RepositoryError, match="非有限数"):
+        repo.create_evidence(
+            run_id="r-n5",
+            evidence_id="ev_1",
+            kind="numeric_check",
+            payload={"value": math.inf},
+            produced_by="test",
+            seq=1,
+        )
+
+
+def test_n5_tool_context_refuses_non_finite_payload() -> None:
+    from veridx.tools.context import ToolContext
+
+    ctx = ToolContext(run_id="r-n5")
+    with pytest.raises(ValueError, match="非有限数"):
+        ctx.record_evidence(
+            kind="numeric_check",
+            payload={"nested": {"value": float("nan")}},
+            produced_by="test",
+        )
+    assert ctx.drafts == [], "拒掉之后不能留下半成品"
+
+
+def test_guard_trace_records_claim_content() -> None:
+    """审查 🟡G：escalated 不写 diagnoses，M5 与 F 类细分要从 trace 重算。"""
+    from veridx.trace.recorder import TraceRecorder
+
+    tracer = TraceRecorder(conn=None, run_id="r-t")
+    runner = Runner(primary=MockProvider(), second=None, tracer=tracer, run_id="r-t")
+    claims = [
+        ClaimWithSeq(
+            claim=Claim(field=ClaimField.ERROR_TYPE, value="程序性错误", evidence_ids=["ev_9"]),
+            seq=3,
+        )
+    ]
+    decision = bind_claims(run_id="r-t", claims=claims, ledger=[])
+    runner._trace_guard(decision, claims=claims, stage="guard", item_id=None)
+    detail = tracer.events()[-1].detail
+    assert detail["claims"][0]["field"] == "error_type"
+    assert detail["claims"][0]["value"] == "程序性错误"
+    assert detail["claims"][0]["evidence_ids"] == ["ev_9"]
+    assert detail["claims"][0]["accepted"] is False
+    assert detail["violations"] == [["error_type", "unknown_evidence"]]
+
+
 @pytest.fixture()
 def conn(tmp_path: Path):  # noqa: ANN201
     connection, _ = store_db.init_db(tmp_path / "runner.db", config.MIGRATIONS_DIR)

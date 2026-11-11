@@ -88,6 +88,21 @@ async def test_verifiable_step_must_pass_program_check() -> None:
     assert [step.verifiable for step in result.steps] == [True, False, False]
 
 
+async def test_equality_expression_is_verified_with_compare() -> None:
+    """`1/2+1/3 == 5/6` 必须用 `compare` 判等，而不是丢给求值器。
+
+    把它直接丢给沙箱会得到 `unsupported_node:Compare` → 所有"可验证"步骤
+    都会被静默降级成"教学性表述"（真实演示里出现过，属于假降级）。
+    """
+    from veridx.flow.runner import Runner
+
+    verified = Runner(primary=MockProvider(), run_id="r-verify")._verify_step("1/2+1/3 == 5/6")
+    assert verified is True
+
+    wrong = Runner(primary=MockProvider(), run_id="r-verify")._verify_step("1/2+1/3 == 5/7")
+    assert wrong is None, "不成立的等式不能算'可验证'"
+
+
 async def test_failed_verification_degrades_to_teaching_step() -> None:
     """程序说"判不了/不成立"时，这一步只能当教学性表述 —— 不许冒充事实。"""
     provider = _provider(

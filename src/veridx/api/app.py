@@ -22,10 +22,13 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.responses import FileResponse
+from starlette.staticfiles import StaticFiles
 from starlette.types import Message, Receive, Scope, Send
 
 from veridx import __version__, config
 from veridx.api.errors import install_error_handlers
+from veridx.api.jobs import JobManager
 from veridx.api.routes import router
 from veridx.clock import new_id
 from veridx.store import db as store_db
@@ -69,7 +72,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             app.state.schema_version = store_db.current_version(conn)
         finally:
             conn.close()
-        yield
+        app.state.jobs = JobManager(resolved)
+        try:
+            yield
+        finally:
+            await app.state.jobs.shutdown()
 
     app = VeriDxFastAPI(
         title="VeriDx",
@@ -85,6 +92,17 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     install_error_handlers(app)
     app.include_router(router)
+
+    # 演示前端（构建产物）：只挂 `/` 与 `/assets`，**不做 "/" 通配 Mount** ——
+    # 通配会把后加的测试路由（如 /boom）一起吞掉，也让未知路径从 404 变成 index.html。
+    dist = Path(__file__).resolve().parents[3] / "web" / "dist"
+    if (dist / "index.html").is_file():
+        app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
+
+        @app.get("/", include_in_schema=False)
+        def index() -> FileResponse:
+            return FileResponse(dist / "index.html")
+
     return app
 
 

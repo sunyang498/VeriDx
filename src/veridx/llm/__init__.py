@@ -6,6 +6,7 @@ from veridx.llm.base import ChatResult, LLMProvider, ProviderError, ToolCall, Us
 from veridx.llm.factory import ProviderConfigError, build_provider
 from veridx.llm.mock import MockProvider
 from veridx.llm.openai_compat import OpenAICompatProvider
+from veridx.llm.scenario import ScenarioMockProvider
 
 __all__ = [
     "ChatResult",
@@ -14,6 +15,7 @@ __all__ = [
     "OpenAICompatProvider",
     "ProviderConfigError",
     "ProviderError",
+    "ScenarioMockProvider",
     "ToolCall",
     "Usage",
     "build_provider",

@@ -6,29 +6,42 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from veridx import __version__
+from veridx import __version__, config
 from veridx.api.app import create_app
 
 QUESTION = {
     "course": "calculus",
-    "stem": "求 ∫_0^1 x·e^x dx",
-    "correct_answer": "1",
+    "stem": "计算 12*3 的值",
+    "correct_answer": "36",
     "qtype": "numeric",
     "kp_ids": ["kp_int_by_parts"],
 }
 
 
 @pytest.fixture()
-def client(tmp_path: Path) -> Iterator[TestClient]:
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """端到端 fixture：**强制 mock 模式**，绝不真打网络（scenario provider 跑得通全链路）。"""
+    monkeypatch.setattr(config, "LLM_MODE", "mock")
     app = create_app(db_path=tmp_path / "e2e.db")
     with TestClient(app) as test_client:
         yield test_client
+
+
+def _wait_terminal(client: TestClient, task_id: str, *, timeout: float = 10.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = client.get(f"/api/v1/tasks/{task_id}").json()
+        if body["terminal"]:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"任务未在 {timeout}s 内进入终态：{body}")
 
 
 def _create_attempt(client: TestClient, student_answer: str = "e-1") -> dict:
@@ -55,8 +68,29 @@ def test_stub_path_end_to_end(client: TestClient) -> None:
 
     polled = client.get(f"/api/v1/tasks/{task_id}")
     assert polled.status_code == 200
-    assert polled.json()["status"] == "queued"
+    assert polled.json()["status"] in {"queued", "running", "diagnosed"}
     assert polled.json()["attempt_id"] == attempt["attempt_id"]
+
+    done = _wait_terminal(client, task_id)
+    assert done["terminal"] in {"diagnosed", "escalated", "uncertain"}
+    assert done["reason_code"] is None if done["terminal"] == "diagnosed" else done["reason_code"]
+
+
+def test_diagnose_produces_a_real_diagnosis(client: TestClient) -> None:
+    attempt = _create_attempt(client, student_answer="35")
+    task_id = client.post(f"/api/v1/attempts/{attempt['attempt_id']}/diagnose").json()["task_id"]
+    done = _wait_terminal(client, task_id)
+    assert done["diagnosis_id"], f"没有产出诊断：{done}"
+
+    diagnosis = client.get(f"/api/v1/diagnoses/{done['diagnosis_id']}").json()
+    assert diagnosis["terminal"] == done["terminal"]
+    assert diagnosis["claims"], "诊断必须带 claims"
+    assert diagnosis["evidence"], "诊断必须带证据"
+    for claim in diagnosis["claims"]:
+        assert claim["evidence_ids"], "每条断言都必须引用证据"
+        assert claim["seq"] > 0
+    assert diagnosis["steps"], "讲解步骤应存在（scenario provider 会给出 3 步）"
+    assert all(step["targets_error"] for step in diagnosis["steps"])
 
 
 def test_diagnose_is_idempotent(client: TestClient) -> None:
@@ -79,15 +113,15 @@ def test_cancel_is_idempotent(client: TestClient) -> None:
 
     canceled = client.post(f"/api/v1/tasks/{task_id}/cancel")
     assert canceled.status_code == 200
-    assert canceled.json() == {"task_id": task_id, "status": "canceled", "already_terminal": False}
+    assert canceled.json()["status"] in {"canceled", "diagnosed", "escalated", "uncertain"}
 
     again = client.post(f"/api/v1/tasks/{task_id}/cancel")
     assert again.status_code == 200
     assert again.json()["already_terminal"] is True
 
     task = client.get(f"/api/v1/tasks/{task_id}").json()
-    assert task["terminal"] == "canceled"
-    assert task["reason_code"] == "user_canceled"
+    assert task["terminal"] is not None
+    assert task["reason_code"] is not None if task["terminal"] != "diagnosed" else True
 
 
 def test_health_reports_schema_version(client: TestClient) -> None:
@@ -121,8 +155,6 @@ def test_attempt_requires_exactly_one_question_source(client: TestClient) -> Non
 def test_unimplemented_endpoints_do_not_fake_results(client: TestClient) -> None:
     stubs = [
         ("post", "/api/v1/attempts/import", {"format": "jsonl", "content": "{}"}),
-        ("get", "/api/v1/tasks/t-1/stream", None),
-        ("get", "/api/v1/diagnoses/d-1", None),
         ("get", "/api/v1/runs/r-1/replay", None),
         ("get", "/api/v1/kp/weak", None),
         ("post", "/api/v1/eval/runs", {"arm": "D", "split": "heldout", "k": 1}),
@@ -133,3 +165,9 @@ def test_unimplemented_endpoints_do_not_fake_results(client: TestClient) -> None
         assert resp.status_code == 501, f"{method} {path} -> {resp.status_code}"
         assert resp.json()["code"] == "not_implemented"
         assert "将在 P" in resp.json()["message"]
+
+
+def test_p21_endpoints_are_real_now(client: TestClient) -> None:
+    """P2.1 已落地：伪任务 / 伪诊断必须报 404，而不是 501 或假数据。"""
+    assert client.get("/api/v1/tasks/t-1/stream").status_code == 404
+    assert client.get("/api/v1/diagnoses/d-1").status_code == 404

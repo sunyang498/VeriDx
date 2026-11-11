@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,6 +25,19 @@ from typing import Any
 from veridx.clock import evidence_id
 from veridx.sandbox import SandboxResult, record_verdict
 from veridx.store.repository import Repository
+
+
+def ensure_finite_payload(payload: dict[str, Any], *, path: str = "payload") -> dict[str, Any]:
+    """N5：非有限数**永不入库**，无论上游有没有挡住。
+
+    用 `json.dumps(allow_nan=False)` 当唯一判据（而不是自己递归找 float）：
+    它就是"能不能落成合法 JSON"的定义，不会与序列化行为漂移。
+    """
+    try:
+        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except ValueError as exc:
+        raise ValueError(f"{path} 含非有限数，拒绝落库：{exc}") from exc
+    return payload
 
 
 @dataclass
@@ -69,13 +83,18 @@ class ToolContext:
 
         没有连接时返回"未持久化"的草稿（挂进 `drafts` 形成内存台账），
         这样工具层与控制流都能脱离数据库单测。
+
+        **N5（全局数值契约的最后一道闸）**：`payload` 是自由 dict，不受
+        `StrictModel.allow_inf_nan=False` 保护，落库前必须自己过一遍
+        `json.dumps(..., allow_nan=False)`。前三次"非有限数穿透"都发生在
+        "以为上游挡住了，所以下游不查"的地方，这里是存储层的最后关口。
         """
         seq = self.next_seq()
         record = {
             "id": evidence_id(seq),
             "run_id": self.run_id,
             "kind": kind,
-            "payload": payload,
+            "payload": ensure_finite_payload(payload),
             "status": status,
             "produced_by": produced_by,
             "seq": seq,
@@ -87,7 +106,7 @@ class ToolContext:
             run_id=self.run_id,
             evidence_id=record["id"],
             kind=kind,
-            payload=payload,
+            payload=record["payload"],
             status=status,
             produced_by=produced_by,
             seq=seq,

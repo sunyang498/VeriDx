@@ -62,7 +62,7 @@ def test_factory_auto_falls_back_to_mock(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(config, "LLM_MODE", "auto")
     monkeypatch.setattr(config, "API_KEY", "")
     provider = build_provider()
-    assert isinstance(provider, MockProvider)
+    assert provider.describe()["mode"] == "mock", "auto 且无 key → mock（但必须可观察）"
 
 
 def test_factory_real_mode_without_key_is_loud(monkeypatch: pytest.MonkeyPatch) -> None:

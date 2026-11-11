@@ -12,8 +12,8 @@ from typing import Any
 
 from veridx import config
 from veridx.llm.base import LLMProvider
-from veridx.llm.mock import MockProvider
 from veridx.llm.openai_compat import OpenAICompatProvider
+from veridx.llm.scenario import ScenarioMockProvider
 
 
 class ProviderConfigError(RuntimeError):
@@ -71,7 +71,8 @@ def build_provider(
     _mode, model, base_url, api_key = _settings_for(role)
 
     if resolved_mode == "mock":
-        return MockProvider(responses=list(responses or []), model=f"mock-{role}")
+        # `mock` 模式下用**按提示词分派**的 provider：整条流水线能真跑通（离线演示/CI）
+        return ScenarioMockProvider(name=f"scenario-mock:{role}", model=f"mock-{role}")
 
     return OpenAICompatProvider(
         model=model,

@@ -152,6 +152,12 @@ class Repository:
         seq: int,
         status: str = "ok",
     ) -> dict[str, Any]:
+        # N5：存储层是全局数值契约的**最后一道闸**（审查 P1.6 §6-D）。
+        # payload 是自由 dict，不受 pydantic 保护；这里用 json 序列化本身当判据。
+        try:
+            serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        except ValueError as exc:
+            raise RepositoryError(f"证据 payload 含非有限数，拒绝落库：{exc}") from exc
         self.conn.execute(
             "INSERT INTO evidence"
             " (id, run_id, kind, payload, status, produced_by, seq, created_at)"
@@ -160,7 +166,7 @@ class Repository:
                 evidence_id,
                 run_id,
                 kind,
-                json.dumps(payload, ensure_ascii=False),
+                serialized,
                 status,
                 produced_by,
                 seq,
@@ -235,6 +241,14 @@ class Repository:
 
     def start_task(self, task_id: str, *, run_id: str | None = None) -> dict[str, Any]:
         return self._transition(task_id, RUNNING, run_id=run_id)
+
+    def add_tokens(self, task_id: str, *, tokens_in: int, tokens_out: int) -> None:
+        """累计 token（成本口径要能落到 tasks 上，否则 done 帧永远报 0）。"""
+        self.conn.execute(
+            "UPDATE tasks SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?,"
+            " updated_at = ? WHERE id = ?",
+            (max(tokens_in, 0), max(tokens_out, 0), now_utc(), task_id),
+        )
 
     def finish_task(self, task_id: str, terminal: str, *, reason_code: str | None = None) -> dict[str, Any]:
         """**唯一**的终态写入口。终态不可再转移。"""

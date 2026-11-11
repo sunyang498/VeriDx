@@ -31,6 +31,7 @@ from veridx.guard.evidence import (
     allocate_claim,
     bind_claims,
     over_escalation,
+    over_escalation_from_outcomes,
 )
 from veridx.tools.context import ToolContext
 from veridx.tools.impl import kb_lookup
@@ -301,7 +302,7 @@ def test_e3_first_divergent_step_needs_step_diff() -> None:
 
 
 def test_e3_root_cause_is_never_relaxed() -> None:
-    """`root_cause` 不随 `error_type` 放宽（审查 §6-必1 第 3 点）。"""
+    """`root_cause` 不随 `error_type` 放宽（自由文本，最容易被编）。"""
     decision = bind_claims(
         run_id=RUN,
         claims=[
@@ -312,8 +313,55 @@ def test_e3_root_cause_is_never_relaxed() -> None:
         ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
     )
     assert (ClaimField.ROOT_CAUSE, BindingViolation.EVIDENCE_CLASS_MISMATCH) in decision.violations
-    assert decision.accepted, "error_type 本身仍可成立（只靠半程序证据，cap 0.5）"
+    assert decision.escalate is False, "error_type 与 error_subtype 仍可成立"
     assert decision.needs_review is True
+
+
+def test_e3_reading_subtype_itself_is_accepted() -> None:
+    """审题性 + 预枚举子类 + condition_check → `error_subtype` **必须** accepted。
+
+    上一版把 `error_subtype` 归进"永不放宽"，与"放宽 `error_type` 必须读 subtype"
+    自相矛盾，导致审题性错误只剩一个字段（审查 §6-必1，是上轮裁定的副作用）。
+    """
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "misread_condition", ["ev_1"], seq=11),
+        ],
+        ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
+    )
+    fields = {item.claim.field for item in decision.accepted}
+    assert fields == {ClaimField.ERROR_TYPE, ClaimField.ERROR_SUBTYPE}
+    assert decision.violations == []
+    assert decision.confidence_cap == SEMI_EVIDENCE_CAP
+
+
+def test_e3_subtype_must_be_in_the_enumerated_set_even_when_relaxed() -> None:
+    """枚举字段的"在集合内"本身就是约束：自造子类不放宽。"""
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "审题性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "我随手写一个", ["ev_1"], seq=11),
+        ],
+        ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
+    )
+    assert (ClaimField.ERROR_SUBTYPE, BindingViolation.EVIDENCE_CLASS_MISMATCH) in decision.violations
+    assert (ClaimField.ERROR_TYPE, BindingViolation.EVIDENCE_CLASS_MISMATCH) in decision.violations
+
+
+def test_e3_subtype_never_relaxed_by_non_reading_error_type() -> None:
+    """`error_type=程序性错误` 时，枚举子类也不能靠 `condition_check` 通过。"""
+    decision = bind_claims(
+        run_id=RUN,
+        claims=[
+            _claim(ClaimField.ERROR_TYPE, "程序性错误", ["ev_1"], seq=10),
+            _claim(ClaimField.ERROR_SUBTYPE, "misread_condition", ["ev_1"], seq=11),
+        ],
+        ledger=[_evidence("ev_1", 1, kind=EvidenceKind.CONDITION_CHECK)],
+    )
+    assert (ClaimField.ERROR_SUBTYPE, BindingViolation.EVIDENCE_CLASS_MISMATCH) in decision.violations
 
 
 # --- E5 escalate + 两个分母 ------------------------------------------------
@@ -489,3 +537,73 @@ def test_kb_lookup_evidence_can_support_kp_ids(conn: sqlite3.Connection) -> None
         ledger=ledger,
     )
     assert decision.accepted, decision.violations
+
+
+# --- 对外口径：分母 = 全部题数，分子排除"正确的 escalate" -------------------
+class _Outcome:
+    """最小替身：`RunResult` 的 (terminal, reason_code, escalation_kind) 三属性。"""
+
+    def __init__(self, terminal: str, reason_code: str | None, kind: str | None = None) -> None:
+        self.terminal = terminal
+        self.reason_code = reason_code
+        self.escalation_kind = EscalationKind(kind) if kind else None
+
+
+def test_over_escalation_denominator_is_all_items() -> None:
+    """分母必须是**全部题数**：只数"跑到 bind_claims 的题"是另一个总体。"""
+    outcomes = [
+        _Outcome("diagnosed", None),
+        _Outcome("diagnosed", None),
+        _Outcome("escalated", "insufficient_evidence", "mechanism"),
+        _Outcome("uncertain", "timed_out"),
+        _Outcome("failed", "internal_error"),
+    ]
+    report = over_escalation_from_outcomes(outcomes)
+    assert report.total == 5
+    assert report.diagnosed == 2
+    assert report.uncertain == 1
+    assert report.failed == 1
+    assert report.mechanism == 1
+    assert report.mechanism_rate == pytest.approx(1 / 5)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["student_answer_correct", "suspected_bad_answer_key", "unparsable_stem", "unparsable_answer"],
+)
+def test_justified_escalations_are_not_over_escalation(reason: str) -> None:
+    """学生本来就对 / 题目有误 / 输入不可用 —— 这些是**正确终局**，不是过度拒绝。"""
+    report = over_escalation_from_outcomes([_Outcome("escalated", reason, "mechanism")])
+    assert report.justified == 1
+    assert report.over_escalation_total == 0
+    assert report.justified_rate == pytest.approx(1.0)
+
+
+def test_report_reports_three_numbers_separately() -> None:
+    outcomes = [
+        _Outcome("diagnosed", None),
+        _Outcome("escalated", "low_confidence", "capability"),
+        _Outcome("escalated", "low_confidence", "capability"),
+        _Outcome("escalated", "insufficient_evidence", "mechanism"),
+        _Outcome("escalated", "student_answer_correct", None),
+    ]
+    data = over_escalation_from_outcomes(outcomes).as_dict()
+    assert data["over_escalation_mechanism"] == 1
+    assert data["over_escalation_capability"] == 2
+    assert data["justified_escalation"] == 1
+    assert data["diagnosed"] == 1
+    assert data["total"] == 5
+    assert data["over_escalation_rate"] == pytest.approx(0.6)
+
+
+def test_unclassified_escalation_counts_as_mechanism() -> None:
+    """没标注口径的 escalate 一律算机制性：宁可高估自己的问题，不美化指标。"""
+    report = over_escalation_from_outcomes([_Outcome("escalated", "tool_error")])
+    assert report.mechanism == 1
+
+
+def test_outcome_aggregator_accepts_dicts() -> None:
+    report = over_escalation_from_outcomes(
+        [{"terminal": "diagnosed", "reason_code": None, "escalation_kind": None}]
+    )
+    assert report.diagnosed == 1

@@ -40,7 +40,8 @@ _TEMPLATE = """你是数学错题诊断专家。请**基于程序证据**给出�
 6. 若声明「审题性错误」，`error_subtype` 必须是 misread_condition / unit_confusion / question_misread 之一；
 7. 「概念性 / 程序性 / 计算表达」必须有**强程序证据**（numeric_check 或 step_diff）才成立；
    证据不足以支撑时，**如实降低 confidence**，不要编造；
-8. `confidence` ∈ [0,1]，表示"这条诊断可信"的程度，不是"学生做错"的程度。
+8. `confidence` ∈ [0,1]，表示"这条诊断可信"的程度，不是"学生做错"的程度；
+9. `kp_ids` **只放在顶层字段**，不要为它写 claim（除非证据列表里已有 `kb_lookup`）。
 
 【输出格式】只输出一段 JSON：
 {{"error_type": "", "error_subtype": null, "root_cause": "", "first_divergent_step": null,

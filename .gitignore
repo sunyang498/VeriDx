@@ -27,6 +27,12 @@ out.json
 eval/reports/*.json.tmp
 logs/
 
+# ---- 前端（web/）----
+# node_modules / dist 是构建产物：仓库只留源码，演示前跑 npm ci && npm run build
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+
 # ---- 文档策略（2026-11-10 定稿）：仓库只上传「需求与设计文档」这一份 ----
 # 理由：设计文档是对外承诺（SSOT），其余文档要么是过程材料，要么是给我自己的教学材料。
 #   learn/     教学笔记，写给"未来的我"，不是项目产出

@@ -191,6 +191,8 @@ class TaskOut(StrictModel):
     run_id: str | None = None
     created_at: str
     updated_at: str
+    #: 诊断行的 id（P2.1 新增，加字段不改含义）；未产出诊断时为 None
+    diagnosis_id: str | None = None
 
 
 class CancelOut(StrictModel):
