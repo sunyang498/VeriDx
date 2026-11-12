@@ -103,18 +103,41 @@ async def test_retry_count_is_bounded(conn: sqlite3.Connection) -> None:
 # --- 预算闸门 --------------------------------------------------------------
 async def test_budget_gate_stops_retries(conn: sqlite3.Connection) -> None:
     """重试是"放大结构"：预算不够就降级，不许烧完再报错。"""
+    from veridx.guard.structured import estimate_call_tokens
+
     tracer = TraceRecorder(conn, "r-1")
     provider = MockProvider(responses=["bad", "bad", "bad"])
-    budget = Budget(remaining_tokens=0, estimated_call_tokens=1500)
+    messages = [{"role": "user", "content": "q"}]
+    # 刚好够**一次**：估算值即上限，spend 之后剩的就不够再来一次
+    budget = Budget(remaining_tokens=estimate_call_tokens(messages))
 
     with pytest.raises(StructuredOutputError):
-        await call_structured(
-            provider, [{"role": "user", "content": "q"}], Diagnosis, tracer=tracer, budget=budget
-        )
+        await call_structured(provider, messages, Diagnosis, tracer=tracer, budget=budget)
 
     assert len(provider.calls) == 1, "预算不足时不允许重试"
     skipped = [e for e in tracer.events() if e.status == "skipped"]
     assert skipped and skipped[0].reason_code == "skipped_budget"
+
+
+async def test_budget_is_estimated_before_the_first_call() -> None:
+    """**必10**：首次调用 `spent == 0`，事后记账必然放行 —— 必须先估算。
+
+    1.6MB 题干 ≈ 53 万 token，单题预算 4 万：一个请求都不该发出去。
+    """
+    provider = MockProvider(responses=["{}"] * 5)
+    budget = Budget(remaining_tokens=config.PER_ITEM_TOKENS)
+    huge = "x" * 1_600_000
+
+    with pytest.raises(StructuredOutputError) as excinfo:
+        await call_structured(
+            provider,
+            [{"role": "user", "content": huge}],
+            Diagnosis,
+            budget=budget,
+        )
+
+    assert provider.calls == [], "预算不够时连第一个请求都不许发"
+    assert excinfo.value.budget_blocked is True
 
 
 async def test_budget_is_charged_on_success(conn: sqlite3.Connection) -> None:

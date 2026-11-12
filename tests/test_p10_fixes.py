@@ -58,20 +58,20 @@ def test_read_version_on_valid_db_is_read_only(tmp_path: Path) -> None:
     conn.execute("PRAGMA journal_mode=DELETE")  # 关掉 WAL，保证只读可见
     conn.close()
 
-    assert store_db.read_version(db) == 2
+    assert store_db.read_version(db) == 3
 
 
 def test_current_version_never_writes(conn: sqlite3.Connection) -> None:
     """`/health` 每请求都调它，所以它必须是纯读。"""
-    assert store_db.current_version(conn) == 2
-    assert store_db.current_version(conn) == 2
+    assert store_db.current_version(conn) == 3
+    assert store_db.current_version(conn) == 3
 
 
 def test_health_works_on_read_only_connection(conn: sqlite3.Connection, tmp_path: Path) -> None:
     path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
     readonly = store_db.connect(path, read_only=True)
     try:
-        assert store_db.current_version(readonly) == 2
+        assert store_db.current_version(readonly) == 3
     finally:
         readonly.close()
 

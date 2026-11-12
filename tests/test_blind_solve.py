@@ -44,14 +44,18 @@ def _provider(*responses: str) -> MockProvider:
 
 # --- ① 信息集隔离 ----------------------------------------------------------
 def test_render_only_accepts_stem() -> None:
-    """签名里没有学生答案 —— "忘记隔离"这件事在类型层面就做不到。"""
-    params = list(inspect.signature(prompt.render).parameters)
+    """签名里没有学生答案 —— "忘记隔离"这件事在类型层面就做不到。
+
+    `nonce` 是**边界令牌**而不是输入（调用方也可注入以便测试），
+    所以这里断言"除 nonce 外只收 stem"。
+    """
+    params = [p for p in inspect.signature(prompt.render).parameters if p != "nonce"]
     assert params == ["stem"]
 
 
 def test_prompt_never_contains_student_answer() -> None:
     """渲染出的 prompt 里没有学生答案（这条与"签名只收题干"是两道独立的锁）。"""
-    messages = build_messages(STEM)
+    messages, _ = build_messages(STEM)
     joined = "\n".join(str(m["content"]) for m in messages)
     assert STUDENT_WRONG not in joined
     assert "学生答案" not in joined
@@ -68,7 +72,12 @@ async def test_provider_receives_no_student_answer() -> None:
 async def test_leaked_answer_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     """若 prompt 里出现"题干本没有、学生答案却有"的字符串，直接拒（隔离被破坏）。"""
     original = prompt.render
-    monkeypatch.setattr(prompt, "render", lambda stem: original(stem) + "\n学生答案：1/4")
+
+    def leaky(stem: str, *, nonce: str | None = None) -> tuple[str, str]:
+        body, token = original(stem, nonce=nonce)
+        return body + "\n学生答案：1/4", token
+
+    monkeypatch.setattr(prompt, "render", leaky)
     provider = _provider(_draft(KEY))
     with pytest.raises(ValueError, match="泄露"):
         await blind_solve(provider, stem=STEM, correct_answer=KEY, student_answer=STUDENT_WRONG)

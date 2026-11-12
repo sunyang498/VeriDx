@@ -1,8 +1,11 @@
 """P1.3 验收：Provider 抽象 + 事件循环不被阻塞 + SSE 心跳不断。
 
-关键一条（审查 §8.6）：**并发 3 个慢请求时 SSE 心跳不断** ——
-而且用**保留的 TD1 缺陷**（常量表达式绕过指数上限 → 超时 3–4s）去制造真实慢请求，
-不是造一个 mock 慢接口。这是那条缺陷作为基线素材的第一个正面用途。
+关键一条（审查 §8.6）：**并发 3 个慢请求时 SSE 心跳不断**。
+
+慢请求的来源在必7 之后变了：原来用保留的 TD1 缺陷（常量折叠绕过指数上限 → 超时）
+制造，而必7 的静态位数上界现在会在执行前拦住它 —— 这正是"必7 覆盖 TD1 症状"的
+预期结果（见审查 §8.3 的边界说明）。慢请求改用 `SLOW_EXPR`：符号表达式让 sympy
+求值本身变慢，仍由沙箱预算兜住。**TD1 本身没有改动**，A vs A′ 的基线仍在。
 """
 
 from __future__ import annotations
@@ -27,6 +30,19 @@ from veridx.sched.aio import run_blocking, run_blocking_many
 from veridx.trace.secrets import contains_secret
 
 SECRET = "sk-live-ABCDEFGH1234567890"
+
+#: 慢请求样本：一个**确定性阻塞**的工作，用于验证"阻塞期间事件循环与心跳都不停"。
+#:
+#: 原来用 TD1 缺陷（常量折叠绕过指数上限 → 沙箱超时）制造慢请求；必7 的静态位数闸
+#: 现在会在执行前拦住它（"必7 覆盖 TD1 症状"的预期结果，**TD1 本身未改**）。
+#: 改用数学 API（如 `expand`）又会被必5 归类为 `math_api` 直接拒。
+#: 所以这里退回最诚实的做法：验**调度层**（`run_blocking` / SSE 心跳），不假称验沙箱。
+SLOW_SECONDS = 0.8
+
+
+def _slow_work() -> str:
+    time.sleep(SLOW_SECONDS)
+    return "slow-done"
 
 
 @pytest.fixture(autouse=True)
@@ -263,9 +279,8 @@ async def test_run_blocking_does_not_block_loop() -> None:
     assert ticks >= 5, f"阻塞调用期间事件循环停了（ticks={ticks}）"
 
 
-async def test_slow_sandbox_calls_do_not_starve_the_loop() -> None:
-    """用保留的 TD1 缺陷制造真实慢请求（常量表达式绕过指数上限 → 超时）。"""
-    slow = "10**(3*3*3*3*3*3*3*3*3*3)"
+async def test_slow_blocking_calls_do_not_starve_the_loop() -> None:
+    """**调度层**验收：阻塞调用期间事件循环仍能推进（心跳的前提）。"""
     ticks = 0
 
     async def ticker(stop: asyncio.Event) -> None:
@@ -278,25 +293,24 @@ async def test_slow_sandbox_calls_do_not_starve_the_loop() -> None:
     ticker_task = asyncio.create_task(ticker(stop))
 
     results = await run_blocking_many(
-        (evaluate, (slow,)),
+        (_slow_work, ()),
         (evaluate, ("1+1",)),
         (evaluate, ("2+2",)),
     )
 
     stop.set()
     await ticker_task
+    assert results[0] == "slow-done"
     assert results[1].verdict.value == "ok"
     assert ticks >= 5, f"慢请求阻塞了事件循环（ticks={ticks}）"
-    assert results[0].verdict.value in {"timeout", "rejected", "error"}
 
 
 # --- SSE 心跳 --------------------------------------------------------------
 async def test_heartbeat_continues_during_slow_work() -> None:
     """审查 §8.6 的关键验收：慢请求期间心跳不断，`done` 恰好一次且在最后。"""
-    slow = "10**(3*3*3*3*3*3*3*3*3*3)"
 
     async def work() -> object:
-        return await run_blocking(evaluate, slow)
+        return await run_blocking(_slow_work)
 
     frames = [frame async for frame in heartbeat_stream(work, run_id="r-slow", interval=0.2)]
 
@@ -320,11 +334,10 @@ async def test_heartbeat_emits_done_on_failure() -> None:
 
 async def test_three_concurrent_slow_requests_keep_heartbeat() -> None:
     """3 个并发慢请求，每个都在自己的 SSE 流里发心跳。"""
-    slow = "10**(3*3*3*3*3*3*3*3*3*3)"
 
     async def one(run_id: str) -> list[str]:
         async def work() -> object:
-            return await run_blocking(evaluate, slow)
+            return await run_blocking(_slow_work)
 
         return [frame async for frame in heartbeat_stream(work, run_id=run_id, interval=0.2)]
 

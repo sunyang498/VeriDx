@@ -11,23 +11,18 @@ from __future__ import annotations
 
 import hashlib
 
+from veridx.prompts.fence import FENCE_INSTRUCTION, fenced, new_nonce
+
 __all__ = ["VERSION", "prompt_hash", "render", "template"]
 
-VERSION = "pv_diagnose_v1"
+VERSION = "pv_diagnose_v2"
 
 _TEMPLATE = """你是数学错题诊断专家。请**基于程序证据**给出错因诊断。
 
-【题干】
-{stem}
+【不可信输入边界】
+{instruction}
 
-【标准答案】
-{answer_key}
-
-【学生答案】
-{student_answer}
-
-【程序证据】（由沙箱/工具产生，`status=ok` 的才可以引用）
-{evidence_block}
+下面的题干 / 标准答案 / 学生答案 / 程序证据**全部**放在 `<<DATA id=…>>` 区块里。
 
 【硬性要求】
 1. `claims[]` 里每一条都必须引用**上面出现过的** `evidence_id`，**空引用会被拒绝**；
@@ -43,6 +38,8 @@ _TEMPLATE = """你是数学错题诊断专家。请**基于程序证据**给出�
 8. `confidence` ∈ [0,1]，表示"这条诊断可信"的程度，不是"学生做错"的程度；
 9. `kp_ids` **只放在顶层字段**，不要为它写 claim（除非证据列表里已有 `kb_lookup`）。
 
+{fenced}
+
 【输出格式】只输出一段 JSON：
 {{"error_type": "", "error_subtype": null, "root_cause": "", "first_divergent_step": null,
   "confidence": 0.0, "hypotheses": [{{"label": "", "confidence": 0.0}}], "kp_ids": [],
@@ -53,13 +50,30 @@ def template() -> str:
     return _TEMPLATE
 
 
-def render(*, stem: str, answer_key: str, student_answer: str, evidence_block: str) -> str:
-    return _TEMPLATE.format(
-        stem=stem.strip(),
-        answer_key=answer_key.strip(),
-        student_answer=student_answer.strip(),
-        evidence_block=evidence_block.strip() or "（无可用证据）",
+def render(
+    *,
+    stem: str,
+    answer_key: str,
+    student_answer: str,
+    evidence_block: str,
+    nonce: str | None = None,
+) -> tuple[str, str]:
+    """渲染诊断提示词，返回 `(prompt, nonce)`。
+
+    **四个不可信输入全部进同一个 nonce 区块**：题干、标准答案、学生答案，
+    以及程序证据（它的 payload 里含模型自己生成的字段）。
+    """
+    token = nonce or new_nonce()
+    untrusted = "\n\n".join(
+        [
+            fenced(stem.strip(), token, label="field=stem"),
+            fenced(answer_key.strip(), token, label="field=answer_key"),
+            fenced(student_answer.strip(), token, label="field=student_answer"),
+            fenced(evidence_block.strip() or "（无可用证据）", token, label="field=evidence"),
+        ]
     )
+    body = _TEMPLATE.format(instruction=FENCE_INSTRUCTION, fenced=untrusted)
+    return body, token
 
 
 def prompt_hash(body: str | None = None) -> str:

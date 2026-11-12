@@ -46,6 +46,13 @@ LOCAL_TOOL_MAX_CALLS = 3
 PER_CALL_CTX_TOKENS = 8000
 #: ⟨T⟩ 单题累计 token（NFR-2 的第二个维度），首批实测后回填
 PER_ITEM_TOKENS = 40_000
+#: 单次补全的**输出上界**（审查 必10）：预算事前估算必须用它，而不是"期望输出长度"。
+#: 用期望值等于**假设模型会配合**——而这正是我们要防的那个假设。
+MAX_COMPLETION_TOKENS = 2048
+#: 粗估 token 时的字符/token 比（中文偏保守：3 字符 ≈ 1 token）
+CHARS_PER_TOKEN = 3
+#: prompt 模板本身的固定开销（角色声明 + 输出格式说明）
+PROMPT_OVERHEAD_TOKENS = 400
 WALL_CLOCK_SECONDS = 180
 #: T1 用例口径：注入 300s 挂死题时，整批仍须在该上限内出报告
 BATCH_WALL_CLOCK_SECONDS = 200
@@ -58,14 +65,23 @@ SANDBOX_TIMEOUT_SECONDS = 3.0
 #: 冷启动预算（spawn + import sympy ≈1.1s，留足余量）
 SANDBOX_COLD_TIMEOUT_SECONDS = 8.0
 SANDBOX_TERMINATE_GRACE_SECONDS = 1.0
-#: **双阈值**：容量内正常判定；介于两者之间是"能力边界"（unsupported:oversize）；
+#: 入口闸门（§8.5 + 审查 必1）
+#: **两个目的地，两个闸**：`student_answer`/`correct_answer` 进沙箱；
+#: `stem` 进 prompt。之前只守了前者。
+#: 双阈值：容量内正常判定；介于两者之间是"能力边界"（unsupported:oversize）；
 #: 超过硬上限才是资源攻击（rejected:expr_too_long）
 SANDBOX_MAX_EXPR_LEN = 256
+#: 题干的入口上限。2000 字符足够容纳任何应试题干；它挡的是"用题面烧 prompt token"。
+STEM_MAX_CHARS = 2000
 SANDBOX_HARD_EXPR_LEN = 4096
 SANDBOX_MAX_AST_NODES = 200
 SANDBOX_MAX_EXPONENT = 200
 SANDBOX_MAX_NESTED_POW = 1
 SANDBOX_MAX_INT_LITERAL = 10**9
+#: **静态答案位数上界**（审查 必7）。取 4000：Python `int→str` 的上限是 4300 位
+#: （`sys.int_info.str_digits_check_threshold`），留 300 位余量。
+#: 这是**容量**判据而不是能力判据（ADR-018 三分法），所以判 `unsupported`、不进 M17。
+SANDBOX_MAX_RESULT_DIGITS = 4000
 SANDBOX_LRU_SIZE = 128
 #: 常驻 worker 池容量（并发请求数决定；超出则排队等空闲 worker）
 SANDBOX_WORKER_POOL_SIZE = 2

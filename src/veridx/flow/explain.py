@@ -37,11 +37,11 @@ MIN_STEPS = 3
 
 class StepDraft(BaseModel):
     title: str = Field(min_length=1, max_length=120)
-    content: str = Field(min_length=1)
-    key_point: str | None = None
-    targets_error: str = Field(min_length=1, description="这一步针对学生的哪个错误动作")
+    content: str = Field(min_length=1, max_length=800)
+    key_point: str | None = Field(default=None, max_length=200)
+    targets_error: str = Field(min_length=1, max_length=200, description="这一步针对学生的哪个错误动作")
     verifiable: bool = False
-    verifiable_expr: str | None = None
+    verifiable_expr: str | None = Field(default=None, max_length=256)
 
 
 class ExplainDraft(BaseModel):
@@ -89,6 +89,30 @@ class Explanation:
 #: 复核器：给一个表达式，返回 True=验算通过 / False=不通过 / None=判不了
 Verifier = Callable[[str], bool | None]
 
+#: 否定标准答案的表述（审查 必12）：讲解无权下这个判断（那是盲解分支 B 的职责）
+_NEGATIONS: tuple[str, ...] = (
+    "标准答案是错的",
+    "标准答案有误",
+    "标准答案错误",
+    "答案键有误",
+    "答案键错误",
+    "题目出错了",
+    "题目有误",
+    "题错了",
+)
+
+
+def _negates_answer_key(content: str) -> bool:
+    text = content.replace(" ", "")
+    return any(phrase in text for phrase in _NEGATIONS)
+
+
+def _names_accepted_field(targets_error: str, accepted_fields: set[str]) -> bool:
+    """`targets_error` 必须点名一个**已被证据绑定**的字段（审查 必11）。"""
+    if not accepted_fields:
+        return True  # 没有可点名的字段时不该因此丢步骤（例如全未绑定）
+    return any(field in targets_error for field in accepted_fields)
+
 
 async def explain(
     provider: LLMProvider,
@@ -101,21 +125,28 @@ async def explain(
     tracer: TraceRecorder | None = None,
     budget: Budget | None = None,
     verify: Verifier | None = None,
+    accepted_fields: set[str] | None = None,
     item_id: str | None = None,
 ) -> Explanation:
-    """生成分步讲解。**永不抛异常**：失败 → `degraded=True`，由调用方降级。"""
+    """生成分步讲解。**永不抛异常**：失败 → `degraded=True`，由调用方降级。
+
+    `accepted_fields`（审查 必11）：**已通过 E1–E5 的 claim 字段名**。
+    讲解的每一步必须点名其中之一 —— 讲解是"**展开已有证据的诊断**"，
+    不是"重新解释这道题"。给 `None` 时跳过该校验（离线/单测路径）。
+    """
+    body, nonce = prompt.render(
+        stem=stem,
+        student_answer=student_answer,
+        error_type=error_type,
+        error_subtype=error_subtype,
+        root_cause=root_cause,
+    )
     messages = [
-        {"role": "system", "content": "你是数学老师，只讲补救步骤，不下诊断结论。"},
         {
-            "role": "user",
-            "content": prompt.render(
-                stem=stem,
-                student_answer=student_answer,
-                error_type=error_type,
-                error_subtype=error_subtype,
-                root_cause=root_cause,
-            ),
+            "role": "system",
+            "content": ("你是数学老师，只讲补救步骤，不下诊断结论。\n\n" + prompt.FENCE_INSTRUCTION),
         },
+        {"role": "user", "content": body},
     ]
 
     try:
@@ -134,8 +165,18 @@ async def explain(
     draft = result.model if isinstance(result.model, ExplainDraft) else ExplainDraft(**result.data)
     steps: list[ExplanationStep] = []
     dropped = 0
+    unauthorized = 0
     for raw in draft.steps:
-        if not raw.targets_error.strip():
+        targets = raw.targets_error.strip()
+        if not targets:
+            dropped += 1
+            continue
+        if accepted_fields is not None and not _names_accepted_field(targets, accepted_fields):
+            # 必11：点不出已被证实的断言 = 讲解在自由创作 → 丢弃这一步
+            unauthorized += 1
+            continue
+        if _negates_answer_key(raw.content):
+            # 必12：否定标准答案是盲解分支 B 的职责，讲解无权下这个判断
             dropped += 1
             continue
         verifiable = False
@@ -148,7 +189,7 @@ async def explain(
                 title=raw.title.strip(),
                 content=raw.content.strip(),
                 key_point=(raw.key_point or "").strip() or None,
-                targets_error=raw.targets_error.strip(),
+                targets_error=targets,
                 verifiable=verifiable,
             )
         )
@@ -158,7 +199,12 @@ async def explain(
             tracer,
             item_id=item_id,
             reason="explain_too_few_steps",
-            detail={"kept": len(steps), "dropped": dropped},
+            detail={
+                "kept": len(steps),
+                "dropped": dropped,
+                "unauthorized": unauthorized,
+                "l0_nonce": nonce,
+            },
         )
         return Explanation(
             steps=steps,

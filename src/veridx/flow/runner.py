@@ -53,10 +53,12 @@ from veridx.guard.evidence import (
     capability_gap,
     reserve_claim_seqs,
 )
+from veridx.guard.injection import scan_untrusted
 from veridx.guard.structured import Budget, StructuredOutputError, call_structured
 from veridx.llm.base import LLMProvider
 from veridx.prompts import diagnose as diagnose_prompt
-from veridx.sandbox import Verdict, compare, evaluate
+from veridx.sandbox import Verdict, compare, evaluate, static_check
+from veridx.sandbox.verdict import Reason
 from veridx.store.repository import Repository
 from veridx.taxonomy import ErrorType
 from veridx.tools.context import ToolContext
@@ -76,16 +78,18 @@ class DiagnoseDraft(BaseModel):
 
     `claims` 直接复用 `Claim`（`extra="forbid"`）——模型若自带 `seq`，整条 claim 会被
     pydantic 拒掉并触发回喂重试（这是 §6.1 的反作弊面）。
+
+    长度上限（审查 必3）与盲解同理：输出是**不可信的大对象**。
     """
 
     error_type: ErrorType
-    error_subtype: str | None = None
-    root_cause: str = ""
+    error_subtype: str | None = Field(default=None, max_length=64)
+    root_cause: str = Field(default="", max_length=500)
     first_divergent_step: int | None = None
     confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
-    hypotheses: list[dict[str, Any]] = Field(default_factory=list)
-    kp_ids: list[str] = Field(default_factory=list)
-    claims: list[Claim] = Field(min_length=1)
+    hypotheses: list[dict[str, Any]] = Field(default_factory=list, max_length=3)
+    kp_ids: list[str] = Field(default_factory=list, max_length=6)
+    claims: list[Claim] = Field(min_length=1, max_length=8)
 
 
 @dataclass(frozen=True)
@@ -306,6 +310,19 @@ class Runner:
             self._finish(Terminal.NEEDS_CLARIFICATION, ReasonCode.UNPARSABLE_ANSWER.value)
         if not spec.answer_key.strip():
             raise self._reject(NodeName.PARSE, ReasonCode.UNPARSABLE_STEM, "标准答案为空")
+        key_static = static_check(spec.answer_key)
+        if key_static is not None and key_static[1].startswith(Reason.NOT_REPRESENTABLE.value):
+            # 必6（X4）：**答案键本身**超出可表示范围 → 能力边界（映射 escalated），
+            # 不能让它退化成"判不了/格式错"：那会把容量问题说成输入问题。
+            # 静态判（0.2ms）→ 一个请求都不发，比等模型答完再说便宜得多。
+            self.tracer.event(
+                NodeName.PARSE.value,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.ANSWER_UNREPRESENTABLE.value,
+                detail={"reason": key_static[1], "answer_key_len": len(spec.answer_key)},
+                item_id=spec.item_id,
+            )
+            self._finish(Terminal.ESCALATED, ReasonCode.ANSWER_UNREPRESENTABLE.value)
         self.tracer.event(
             NodeName.PARSE.value,
             status=NodeStatus.OK,
@@ -339,6 +356,10 @@ class Runner:
             second_provider=self.second,
             item_id=spec.item_id,
         )
+        if "budget_insufficient_before_call" in outcome.notes:
+            # 必10：**一个请求都没发**。不许把它记成一次 LLM 调用。
+            self.notes.append("budget_insufficient_before_call")
+            self._finish(Terminal.UNCERTAIN, ReasonCode.SKIPPED_BUDGET.value)
         self._spend(outcome.usage_total)
         self._blind = outcome
 
@@ -403,18 +424,30 @@ class Runner:
 
     async def _node_diagnose(self, spec: RunSpec) -> DiagnoseDraft:
         self._check_budget(NodeName.DIAGNOSE.value)
+        body, nonce = diagnose_prompt.render(
+            stem=spec.stem,
+            answer_key=spec.answer_key,
+            student_answer=spec.student_answer,
+            evidence_block=self._evidence_block(),
+        )
         messages = [
-            {"role": "system", "content": "你是数学错题诊断专家，只依据给定证据下结论。"},
             {
-                "role": "user",
-                "content": diagnose_prompt.render(
-                    stem=spec.stem,
-                    answer_key=spec.answer_key,
-                    student_answer=spec.student_answer,
-                    evidence_block=self._evidence_block(),
+                "role": "system",
+                "content": (
+                    "你是数学错题诊断专家，只依据给定证据下结论。\n\n" + diagnose_prompt.FENCE_INSTRUCTION
                 ),
             },
+            {"role": "user", "content": body},
         ]
+        self.tracer.event(
+            NodeName.DIAGNOSE.value,
+            status=NodeStatus.OK,
+            detail={
+                "l0": {"nonce": nonce, "fenced": True, "prompt_chars": len(body)},
+                "l1_hits": scan_untrusted("\n".join([spec.stem, spec.answer_key, spec.student_answer])),
+            },
+            item_id=spec.item_id,
+        )
         try:
             result = await call_structured(
                 self.primary,
@@ -527,6 +560,7 @@ class Runner:
         if not self.limits.explain:
             return None
         self._check_budget(NodeName.EXPLAIN.value)
+        accepted_fields = {v.claim.field.value for v in decision.verdicts if v.accepted}
         explanation = await explain(
             self.primary,
             stem=spec.stem,
@@ -537,8 +571,11 @@ class Runner:
             tracer=self.tracer,
             budget=self.budget,
             verify=self._verify_step,
+            accepted_fields=accepted_fields,
             item_id=spec.item_id,
         )
+        if "budget_insufficient_before_call" in (explanation.reason or ""):
+            self.notes.append("budget_insufficient_before_call")
         self._spend(explanation.usage_total)
         if explanation.degraded:
             # 降级阶梯第 1 档：只给结构化诊断，不报错

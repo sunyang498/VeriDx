@@ -128,7 +128,7 @@ def test_health_reports_schema_version(client: TestClient) -> None:
     body = client.get("/api/v1/health").json()
     assert body["status"] in {"ok", "degraded"}
     assert body["version"] == __version__
-    assert body["schema_version"] == 2
+    assert body["schema_version"] == 3
     assert body["provider"]["reachable"] is None  # 健康检查不做网络探测
 
 

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -36,15 +37,23 @@ TModel = TypeVar("TModel", bound=BaseModel)
 class StructuredOutputError(RuntimeError):
     """重试耗尽仍不合法。上层据此降级（`escalate` 或"只给诊断不含讲解"）。"""
 
-    def __init__(self, errors: list[str], *, attempts: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        errors: list[str],
+        *,
+        attempts: list[dict[str, Any]],
+        budget_blocked: bool = False,
+    ) -> None:
         super().__init__("; ".join(errors)[:300])
         self.errors = errors
         self.attempts = attempts
+        #: `True` = **一次请求都没发**（事前估算判定预算不够）。上层据此避免把它记成一次调用。
+        self.budget_blocked = budget_blocked
 
 
 @dataclass
 class Budget:
-    """token 预算闸门（重试前必查）。"""
+    """token 预算闸门（**事前估算**，不是事后记账 —— 审查 必10）。"""
 
     remaining_tokens: int
     #: 每次重试的估算成本（保守值）
@@ -55,6 +64,27 @@ class Budget:
 
     def spend(self, tokens: int) -> None:
         self.remaining_tokens -= max(tokens, 0)
+
+    def estimate(self, messages: list[dict[str, Any]]) -> int:
+        """本次调用**最多**可能花多少 token（输入 + 输出上界）。判不了就按最大算。"""
+        return estimate_call_tokens(messages)
+
+    def can_afford_messages(self, messages: list[dict[str, Any]]) -> bool:
+        return self.remaining_tokens >= self.estimate(messages)
+
+
+def estimate_call_tokens(messages: list[dict[str, Any]]) -> int:
+    """**事前**估算一次调用的 token 成本（上界，不是期望值）。
+
+    输出必须用 `MAX_COMPLETION_TOKENS`：用"期望输出长度"等于**假设模型会配合**，
+    而这正是要防的那个假设（审查 必10）。
+    """
+    try:
+        size = len(json.dumps(messages, ensure_ascii=False))
+    except (TypeError, ValueError):
+        size = config.PER_CALL_CTX_TOKENS * config.CHARS_PER_TOKEN
+    estimated_in = size // config.CHARS_PER_TOKEN + config.PROMPT_OVERHEAD_TOKENS
+    return estimated_in + config.MAX_COMPLETION_TOKENS
 
 
 @dataclass
@@ -73,6 +103,20 @@ def _feedback(errors: list[str]) -> str:
         + "\n- ".join(errors)
         + "\n请修正后重新**只输出 JSON**，字段名与取值范围必须完全符合要求。"
     )
+
+
+def _is_fatal(errors: list[str]) -> bool:
+    """这些错误重试无意义（必4）：输出被截断 / 输出超长。
+
+    判据是"同一个上下文再问一次会不会变"——截断与超长都是**确定性**的。
+    """
+    for error in errors:
+        head = error.split(":", 1)[0].strip()
+        if head in {"truncated", "too_long"}:
+            return True
+        if "String should have at most" in error:
+            return True
+    return False
 
 
 def _archive(raw: str) -> dict[str, Any]:
@@ -114,7 +158,7 @@ async def call_structured(
         )
 
     for attempt_index in range(retries + 1):
-        if budget is not None and attempt_index > 0 and not budget.can_afford():
+        if budget is not None and attempt_index > 0 and not budget.can_afford_messages(conversation):
             if tracer is not None:
                 tracer.event(
                     node,
@@ -124,6 +168,27 @@ async def call_structured(
                 )
             errors.append("budget_exhausted_before_retry")
             raise StructuredOutputError(errors, attempts=attempts)
+
+        # 必10：**发请求之前**先算这次最多要花多少。首次调用 `spent == 0` 时
+        # 事后记账必然放行 —— 1.6MB 题干会在 spent=0 时烧穿 25 倍单题预算。
+        if budget is not None:
+            estimate = budget.estimate(conversation)
+            if estimate > budget.remaining_tokens:
+                if tracer is not None:
+                    tracer.event(
+                        node,
+                        status=NodeStatus.SKIPPED,
+                        reason_code=ReasonCode.SKIPPED_BUDGET.value,
+                        detail={
+                            "attempt_index": attempt_index,
+                            "reason": "budget_insufficient_before_call",
+                            "estimated_tokens": estimate,
+                            "remaining_tokens": budget.remaining_tokens,
+                            "prompt_chars": sum(len(str(m.get("content", ""))) for m in conversation),
+                        },
+                    )
+                errors.append("budget_insufficient_before_call")
+                raise StructuredOutputError(errors, attempts=attempts, budget_blocked=True)
 
         try:
             result: ChatResult = await provider.chat(
@@ -210,6 +275,23 @@ async def call_structured(
                 usage_total=usage_total,
                 parse=parsed,
             )
+
+        if _is_fatal(attempt_errors):
+            # 必4：**截断/超限是确定性的**。同一上下文 + 同一 max_tokens 重试只会再截断一次，
+            # 成本 ×3、成功率不涨。所以直接终局，不进下一轮。
+            if tracer is not None:
+                tracer.event(
+                    node,
+                    status=NodeStatus.FAIL,
+                    reason_code=ReasonCode.SCHEMA_INVALID.value,
+                    detail={
+                        "attempt_index": attempt_index,
+                        "errors": attempt_errors,
+                        "fatal": True,
+                        "reason": "non_retryable_output",
+                    },
+                )
+            raise StructuredOutputError(attempt_errors, attempts=attempts)
 
         errors = attempt_errors
         conversation = [

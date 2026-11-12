@@ -90,7 +90,8 @@ def _steps(count: int = MIN_STEPS, *, verifiable_expr: str | None = None) -> str
                 "title": f"第 {index + 1} 步",
                 "content": "重新套用幂函数积分公式",
                 "key_point": "指数加一后除以新指数",
-                "targets_error": "把指数当成了分母",
+                # 必11：targets_error 必须点名一个已被证据绑定的字段
+                "targets_error": "root_cause：把指数当成了分母",
                 "verifiable": verifiable_expr is not None and index == 0,
                 "verifiable_expr": verifiable_expr if index == 0 else None,
             }
@@ -399,11 +400,13 @@ async def test_call_budget_stops_immediately() -> None:
 
 
 async def test_token_budget_stops_immediately() -> None:
+    """预算不够时**一个请求都不发**（必10：事前估算，不是事后记账）。"""
     primary, second = _providers(_diagnose(), _steps())
     result, _ = await _run(primary, second, limits=RunLimits(max_tokens=1))
     assert result.terminal is Terminal.UNCERTAIN
     assert result.reason_code == ReasonCode.SKIPPED_BUDGET.value
-    assert result.llm_calls == 1
+    assert result.llm_calls == 0
+    assert primary.calls == [], "预算不够时不许发请求"
 
 
 async def test_wall_clock_budget_stops_immediately() -> None:

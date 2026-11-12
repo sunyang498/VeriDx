@@ -1,6 +1,6 @@
-"""沙箱验收：87 条样本（6 组 / K1–K21）+ 机制级用例。
+"""沙箱验收：94 条样本（7 组 / K1–K22）+ 机制级用例。
 
-分组口径（内容 v3.2）：
+分组口径（内容 v3.6）：
 
 | 组 | 条数 | 判据 |
 |---|---|---|
@@ -10,6 +10,7 @@
 | D 值域边界 | 10 | 绝不判 `ok` |
 | E 输入形态 | 8 | 永不抛 |
 | F 运行时故障 | 4 | `timeout`/`error`，不进 rejected |
+| G 表示规模 | 7 | 4 条 `not_representable`（不计 M17）+ 2 条旧指数闸 + 1 条不误杀 |
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from veridx.sandbox import (
     clear_cache,
     compare,
     evaluate,
+    is_capability,
     ledger,
     normalize_complex_literal,
     reason_prefix,
@@ -42,6 +44,7 @@ from veridx.sandbox.samples import (
     INPUT_FORMS,
     NON_COMPARABLE_PAIRS,
     NORMAL,
+    NOT_REPRESENTABLE,
     TOLERANCE_PAIRS,
     UNSUPPORTED,
     group_counts,
@@ -78,7 +81,9 @@ def test_group_counts_match_design() -> None:
     assert counts["D_domain"] == 10
     assert counts["E_input_forms"] == 8
     assert counts["F_runtime_faults"] == 4
-    assert counts["total"] == 87
+    # G 组（审查 必7/必8）：表示规模是**独立于计算量**的第四根成本轴
+    assert counts["G_not_representable"] == 7
+    assert counts["total"] == 94
 
 
 # --- A 攻击：逃逸 = 0，且必须记在能力集合里 ---------------------------------
@@ -122,6 +127,21 @@ def test_input_form_never_raises(sample) -> None:  # noqa: ANN001
     assert isinstance(result, SandboxResult)
     assert result.verdict is Verdict.UNSUPPORTED, sample.why
     assert result.reason.startswith(sample.reason_prefix), sample.why
+
+
+# --- G 表示规模：短输入 / 巨答案，且**不能**算成能力不足 --------------------
+@pytest.mark.parametrize("sample", NOT_REPRESENTABLE, ids=_label)
+def test_not_representable_group(sample) -> None:  # noqa: ANN001
+    result = evaluate(sample.expr)
+    assert result.verdict is sample.expect, f"{sample.why} -> {result.verdict}:{result.reason}"
+    assert result.reason.startswith(sample.reason_prefix), sample.why
+    if sample.reason_prefix == Reason.NOT_REPRESENTABLE.value:
+        # 答案太大 = **容量**问题，不是模型能力问题（M17 分母不能被污染）
+        assert reason_prefix(result.reason) not in CAPABILITY_REASONS
+        assert not is_capability(result.reason), result.reason
+    elif sample.expect is Verdict.REJECTED:
+        # 现有指数上限先拦：口径未变，仍计入 M17
+        assert is_capability(result.reason), result.reason
 
 
 # --- F 运行时故障（注入）----------------------------------------------------
@@ -287,7 +307,7 @@ def test_rejection_rate_keys_and_m17_semantics(conn: sqlite3.Connection) -> None
     }
     assert "shared_rejected" not in stats, "键名曾写错成 shared_rejected"
     assert stats["capability_count"] == 1, "unsupported 不算能力型"
-    assert stats["reasons_by_verdict"]["rejected"] == {"forbidden_call:globals": 1}
+    assert stats["reasons_by_verdict"]["rejected"] == {"forbidden_call:danger:globals": 1}
 
 
 def test_sandbox_result_fits_evidence_payload(conn: sqlite3.Connection) -> None:

@@ -334,7 +334,7 @@ def test_v1_database_upgrades_without_data_loss(tmp_path: Path) -> None:
     conn.close()
 
     upgraded = store_db.connect(db)
-    assert store_db.apply_migrations(upgraded, config.MIGRATIONS_DIR) == [2]
+    assert store_db.apply_migrations(upgraded, config.MIGRATIONS_DIR) == [2, 3]
 
     attempt = upgraded.execute("SELECT * FROM attempts WHERE id='a-old'").fetchone()
     assert attempt["answer_digest"] == "digest-old"

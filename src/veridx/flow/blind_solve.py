@@ -42,8 +42,9 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from veridx.guard.injection import scan_untrusted
 from veridx.guard.structured import Budget, StructuredOutputError, call_structured
 from veridx.llm.base import LLMProvider
 from veridx.prompts import blind_solve as prompt
@@ -65,12 +66,25 @@ SYSTEM_PROMPT = "你在做一道独立的数学求解题。你不知道也不需
 
 
 class BlindDraft(BaseModel):
-    """盲解输出。`answer` 允许空串（多解/无法唯一确定），此时按 C 分支处理。"""
+    """盲解输出。`answer` 允许空串（多解/无法唯一确定），此时按 C 分支处理。
 
-    answer: str = ""
-    steps: list[str] = Field(default_factory=list)
+    长度上限（审查 必3）：模型的输出是**不可信的大对象**，不设上限时
+    "20 字符的题目 → 20 万 token 的输出"是可行的。超限在 schema 层直接拒，
+    并配合必4（截断/超长**不重试**）→ 成本不会 ×3。
+    """
+
+    answer: str = Field(default="", max_length=512)
+    steps: list[str] = Field(default_factory=list, max_length=8)
     confidence: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
-    note: str = ""
+    note: str = Field(default="", max_length=500)
+
+    @field_validator("steps")
+    @classmethod
+    def _step_lengths(cls, value: list[str]) -> list[str]:
+        for step in value:
+            if len(step) > 500:
+                raise ValueError("单个步骤不得超过 500 字符")
+        return value
 
 
 class Branch(StrEnum):
@@ -114,12 +128,19 @@ class BlindSolveOutcome:
         return self.branch is Branch.A_WRONG
 
 
-def build_messages(stem: str) -> list[dict[str, Any]]:
-    """盲解阶段的对话。**只含题干**，没有任何人（包括学生）的作答。"""
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt.render(stem)},
-    ]
+def build_messages(stem: str, *, nonce: str | None = None) -> tuple[list[dict[str, Any]], str]:
+    """盲解阶段的对话。**只含题干**，没有任何人（包括学生）的作答。
+
+    返回 `(messages, nonce)`：nonce 要进 trace，便于回放时验证边界没被替换过。
+    """
+    body, token = prompt.render(stem, nonce=nonce)
+    return (
+        [
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{prompt.FENCE_INSTRUCTION}"},
+            {"role": "user", "content": body},
+        ],
+        token,
+    )
 
 
 def _equal(left: str, right: str, symbols: frozenset[str] | None) -> bool | None:
@@ -142,9 +163,10 @@ async def blind_solve(
     item_id: str | None = None,
 ) -> BlindSolveOutcome:
     """独立求解 → sympy 判等 → 分支裁决（分支 B 走双闸）。"""
-    messages = build_messages(stem)
+    messages, nonce = build_messages(stem)
     outcome = BlindSolveOutcome(branch=Branch.C_UNCERTAIN, prompt_hash=prompt.prompt_hash())
     _assert_no_leak(messages, stem=stem, student_answer=student_answer)
+    _trace_l0(tracer, stem=stem, nonce=nonce, messages=messages, item_id=item_id)
 
     try:
         result = await call_structured(
@@ -157,6 +179,9 @@ async def blind_solve(
         )
     except StructuredOutputError as exc:
         outcome.notes.append(f"blind_solve_failed:{exc.errors[:2]}")
+        if exc.budget_blocked:
+            # 必10：预算闸在**发请求之前**就拦住了，必须让上层知道"这不是一次调用"
+            outcome.notes.append("budget_insufficient_before_call")
         if tracer is not None:
             tracer.event(
                 NodeName.BLIND_SOLVE.value,
@@ -249,9 +274,10 @@ async def _run_gates(
         outcome.notes.append("gate2_skipped:no_second_provider")
         return
     try:
+        gate2_messages, _ = build_messages(stem)
         second = await call_structured(
             second_provider,
-            build_messages(stem),
+            gate2_messages,
             BlindDraft,
             tracer=tracer,
             budget=budget,
@@ -274,6 +300,38 @@ async def _run_gates(
         outcome.notes.append("gate2_no_answer")
     else:
         outcome.notes.append("gate2_disagreed")
+
+
+def _trace_l0(
+    tracer: TraceRecorder | None,
+    *,
+    stem: str,
+    nonce: str,
+    messages: list[dict[str, Any]],
+    item_id: str | None,
+) -> None:
+    """L0 每次运行都重新做（审查 必13：**不得因为"上次跑过"就跳过**）。
+
+    存储型注入的经典错误是"入库时检查一次，之后永远信任"。这里把每一次渲染都落 trace，
+    所以 trace 里能看到同一道题被检查了两次 —— 这是"确实每次都做"的唯一可测形式。
+    """
+    if tracer is None:
+        return
+    tracer.event(
+        NodeName.PARSE.value,
+        status=NodeStatus.OK,
+        detail={
+            "l0": {
+                "nonce": nonce,
+                "untrusted_chars": len(stem),
+                "fenced": True,
+                "prompt_chars": len(messages[-1]["content"]),
+            },
+            # 必14：**只打标、不拦截**（拦截就是按意图判据，误差全落在正常用户身上）
+            "l1_hits": scan_untrusted(stem),
+        },
+        item_id=item_id,
+    )
 
 
 def _assert_no_leak(messages: list[dict[str, Any]], *, stem: str, student_answer: str) -> None:

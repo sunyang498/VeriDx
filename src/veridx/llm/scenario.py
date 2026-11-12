@@ -27,6 +27,8 @@ from veridx.llm.base import ChatResult, Usage
 __all__ = ["ScenarioMockProvider"]
 
 _EVIDENCE_LINE = re.compile(r"-\s+(ev_\d+)\s+kind=(\w+)\s+status=(\w+)")
+_STEM_BLOCK = re.compile(r"<<DATA id=\w+ field=stem>>\s*\n(.+?)\n<</DATA", re.DOTALL)
+_LEGACY_STEM = re.compile(r"【题干】\s*\n(.+)")
 
 
 @dataclass
@@ -77,7 +79,7 @@ class ScenarioMockProvider:
                             "title": "回到定义",
                             "content": "把这一步的公式重新写一遍，确认指数与分母的位置。",
                             "key_point": "幂函数积分指数加一",
-                            "targets_error": "把 x^2 的指数当成分母",
+                            "targets_error": "root_cause：把 x^2 的指数当成分母",
                             "verifiable": False,
                             "verifiable_expr": None,
                         },
@@ -85,7 +87,7 @@ class ScenarioMockProvider:
                             "title": "代入上下限",
                             "content": "先求原函数，再代上限减下限，别漏掉下限那一项。",
                             "key_point": "牛顿-莱布尼茨公式",
-                            "targets_error": "代入时只算了上限",
+                            "targets_error": "root_cause：代入时只算了上限",
                             "verifiable": False,
                             "verifiable_expr": None,
                         },
@@ -93,7 +95,7 @@ class ScenarioMockProvider:
                             "title": "自查量级",
                             "content": "积分结果应与被积函数在区间上的量级相当，用估值快速自查。",
                             "key_point": "量级自查",
-                            "targets_error": "算完不做合理性检查",
+                            "targets_error": "error_type：算完不做合理性检查",
                             "verifiable": False,
                             "verifiable_expr": None,
                         },
@@ -132,13 +134,17 @@ class ScenarioMockProvider:
         )
 
 
+_STEM_BLOCK = re.compile(r"<<DATA id=\w+ field=stem>>\s*\n(.+?)\n<</DATA", re.DOTALL)
+_LEGACY_STEM = re.compile(r"【题干】\s*\n(.+)")
+
+
 def _extract_expected(prompt: str) -> str:
     """从题干里**算**出答案：脚本 provider 也能扮演"会做题的模型"。
 
     只认纯算术子串（`12*3`、`1/2+1/3`），交给沙箱求值；失败就退回 `1/3`。
     这样离线演示里 `numeric_check` 能真的判等成功，而不是永远"判不了"。
     """
-    match = re.search(r"【题干】\s*\n(.+)", prompt)
+    match = _STEM_BLOCK.search(prompt) or _LEGACY_STEM.search(prompt)
     stem = match.group(1) if match else ""
     for candidate in re.findall(r"[-+*/^().\d\s]{3,}", stem):
         expr = candidate.strip()

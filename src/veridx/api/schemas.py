@@ -13,15 +13,23 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from veridx import config
 from veridx.config import SeedPolicy
 from veridx.guard.claim import ClaimField, Evidence, EvidenceKind
 from veridx.taxonomy import ErrorType
-from veridx.trace.event import TraceEvent
+from veridx.trace.event import ReasonCode, TraceEvent
 
 API_PREFIX = "/api/v1"
+
+
+#: 入口层估"答案有多大"用（审查 必6）：纯数字串的位数，判不了给 None。
+def _digit_count(text: str) -> int | None:
+    body = text.strip().lstrip("+-")
+    if body.isdigit():
+        return len(body.lstrip("0")) or 1
+    return None
 
 
 class StrictModel(BaseModel):
@@ -102,13 +110,35 @@ class Split(StrEnum):
 # ---------------------------------------------------------------------------
 class QuestionCreate(StrictModel):
     course: str = Field(min_length=1, max_length=64)
-    stem: str = Field(min_length=1)
+    #: 入口闸门（审查 必1）：`stem` 是**唯一被完整拼进 prompt** 的字段。
+    #: 之前只给"会进沙箱"的两个字段加了闸，漏了"会进 prompt"的这个 ——
+    #: 1.6MB 题干 ≈ 107 万 token，一次就能烧穿 25 倍单题预算。
+    stem: str = Field(min_length=1, max_length=config.STEM_MAX_CHARS)
     #: 入口闸门（§8.5）：标准答案会被送进沙箱求值，长度上限与 SANDBOX_MAX_EXPR_LEN 同源
     correct_answer: str = Field(min_length=1, max_length=config.SANDBOX_MAX_EXPR_LEN)
     qtype: str | None = Field(default=None, max_length=32)
     difficulty: str | None = Field(default=None, max_length=8)
     kp_ids: list[str] = Field(default_factory=list)
     source: str | None = Field(default=None, max_length=128)
+
+    @field_validator("correct_answer", mode="before")
+    @classmethod
+    def _answer_representable(cls, value: object) -> object:
+        """审查 必6（X4）：答案**太大** ≠ **格式错**。
+
+        超长时若真实原因是位数溢出（可估算），必须报 `answer_unrepresentable`
+        （能力边界，映射 `escalated`），而不是落成
+        `String should have at most 256 characters` —— 后者把"算不出来"说成"写得不对"。
+        非纯数字的超长串仍走原来的长度错误（那确实是格式问题）。
+        """
+        if isinstance(value, str) and len(value) > config.SANDBOX_MAX_EXPR_LEN:
+            digits = _digit_count(value)
+            if digits is not None and digits > config.SANDBOX_MAX_RESULT_DIGITS:
+                raise ValueError(
+                    f"{ReasonCode.ANSWER_UNREPRESENTABLE.value}: 标准答案超出可表示范围"
+                    f"（{digits} 位 > {config.SANDBOX_MAX_RESULT_DIGITS} 位）"
+                )
+        return value
 
 
 class QuestionOut(StrictModel):
@@ -216,6 +246,9 @@ class ExplanationStepOut(StrictModel):
     key_point: str | None = None
     targets_error: str | None = None
     verifiable: bool = False
+    #: 必12：`verifiable=False` 的步骤是**纯模型文本**，前端必须标注"未经程序核验"。
+    #: 默认 True（安全侧）：不加说明就当未核验，不允许"默认已核验"。
+    unverified: bool = True
 
 
 class SimilarQuestionOut(StrictModel):

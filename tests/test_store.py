@@ -48,13 +48,13 @@ def test_migrations_create_all_tables(conn: sqlite3.Connection) -> None:
 def test_migrations_are_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "veridx.db"
     first_conn, first = store_db.init_db(path, config.MIGRATIONS_DIR)
-    assert first == [1, 2]
-    assert store_db.current_version(first_conn) == 2
+    assert first == [1, 2, 3]
+    assert store_db.current_version(first_conn) == 3
     first_conn.close()
 
     second_conn, second = store_db.init_db(path, config.MIGRATIONS_DIR)
     assert second == []
-    assert store_db.current_version(second_conn) == 2
+    assert store_db.current_version(second_conn) == 3
     second_conn.close()
 
 

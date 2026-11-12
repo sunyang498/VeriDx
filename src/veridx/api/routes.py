@@ -442,6 +442,8 @@ def build_diagnosis(conn: sqlite3.Connection, row: Any) -> S.DiagnosisOut:
             key_point=step["key_point"],
             targets_error=step["targets_error"],
             verifiable=bool(step["verifiable"]),
+            # 必12：没被程序核验过的步骤必须显式标注（默认 True = 安全侧）
+            unverified=not bool(step["verifiable"]),
         )
         for step in conn.execute(
             "SELECT * FROM explanation_steps WHERE diagnosis_id = ? ORDER BY seq", (row["id"],)

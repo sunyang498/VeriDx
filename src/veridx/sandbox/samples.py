@@ -167,6 +167,64 @@ DOMAIN: tuple[Sample, ...] = (
 )
 
 # ---------------------------------------------------------------------------
+# G 表示规模 · 7 条（审查 必7/必8 新增，K22）
+#
+# 这一组证明的是**"答案有几位"是独立于"算起来贵不贵"的一根轴**：
+# 44 个字符就能造出 5,400 位的答案，而 CPU 只花 0.2ms —— 超时永远抓不到它。
+#
+# 前 4 条 `unsupported:not_representable`，**不计入 M17**（容量不是能力）：
+#   · 2 条走**静态**位数闸（必7，0ms，一次都不执行）
+#   · 2 条静态判不出、走**子进程**位数闸（必8，`too_large`）
+# 后 2 条证明**现有指数上限先拦**（口径未变，仍计入 M17），
+# 免得把"指数太大"这顶旧帽子悄悄挪到"答案太大"头上。
+# ---------------------------------------------------------------------------
+NOT_REPRESENTABLE: tuple[Sample, ...] = (
+    Sample(
+        "999999999**200 * 999999999**200 * 999999999**200",
+        Verdict.UNSUPPORTED,
+        "not_representable",
+        "44 字符 → 5,403 位：静态位数闸必须拦，且一次都不能执行（必7）",
+        "K22",
+    ),
+    Sample(
+        "999999999**200 * 999999999**200",
+        Verdict.UNSUPPORTED,
+        "not_representable",
+        "3,601 位：静态闸只放到 4,000 位 → 过静态、由**子进程**位数闸兜底（必8）",
+        "K22",
+    ),
+    Sample(
+        "(10**200)**40",
+        Verdict.UNSUPPORTED,
+        "not_representable",
+        "嵌套幂静态判不出位数 → 由子进程位数闸兜底 8,001 位（必8）",
+        "K22",
+    ),
+    Sample(
+        "999999999**200",
+        Verdict.UNSUPPORTED,
+        "not_representable",
+        "1,801 位有限整数：**不是** non_finite（把溢出当值域是错的）",
+        "K22",
+    ),
+    Sample(
+        "10**4000",
+        Verdict.REJECTED,
+        "exponent_too_large",
+        "指数 4,000 > 200：现有指数闸先拦（口径未变，仍计入 M17）",
+        "K22",
+    ),
+    Sample(
+        "2**1023",
+        Verdict.REJECTED,
+        "exponent_too_large",
+        "指数 1,023 > 200：同上（且 SD-1 冻结项不许动）",
+        "K22",
+    ),
+    Sample("10**9", Verdict.OK, "", "10 位：合法且必须仍 ok——位数闸不能误杀", "K22"),
+)
+
+# ---------------------------------------------------------------------------
 # E 输入形态 · 8 条（永不抛）
 # ---------------------------------------------------------------------------
 INPUT_FORMS: tuple[Sample, ...] = (
@@ -207,7 +265,7 @@ RUNTIME_FAULTS: tuple[Sample, ...] = (
     Sample("1+1", Verdict.ERROR, "internal", "最外层兜底捕获漏网异常", "K20"),
 )
 
-ALL_SAMPLES: tuple[Sample, ...] = ATTACKS + NORMAL + UNSUPPORTED + DOMAIN + INPUT_FORMS
+ALL_SAMPLES: tuple[Sample, ...] = ATTACKS + NORMAL + UNSUPPORTED + DOMAIN + NOT_REPRESENTABLE + INPUT_FORMS
 
 
 def group_counts() -> dict[str, int]:
@@ -218,5 +276,6 @@ def group_counts() -> dict[str, int]:
         "D_domain": len(DOMAIN),
         "E_input_forms": len(INPUT_FORMS),
         "F_runtime_faults": len(RUNTIME_FAULTS),
+        "G_not_representable": len(NOT_REPRESENTABLE),
         "total": len(ALL_SAMPLES) + len(RUNTIME_FAULTS),
     }

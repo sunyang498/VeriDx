@@ -26,9 +26,10 @@
 from __future__ import annotations
 
 import ast
+import math
 
 from veridx import config
-from veridx.sandbox.verdict import Reason, Verdict
+from veridx.sandbox.verdict import CALL_KIND_DANGER, CALL_KIND_MATH_API, MATH_API_CALLS, Reason, Verdict
 
 #: 函数白名单。**不含 `factorial`**：既是 DoS 面（`factorial(10**7)`）又非必需。
 #: 函数名**只能**出现在 `Call.func`；当值使用 → `unsupported:function_as_value`。
@@ -128,6 +129,132 @@ def _type_name(node: ast.AST) -> str:
     return type(node).__name__
 
 
+#: 位数上界的哨兵：明显超出任何阈值，用于"能证明超限但算不出精确位数"的场合
+_HUGE_DIGITS = 10**9
+
+
+def _const_number(node: ast.AST) -> int | float | None:
+    """纯字面量子树 → 数值；含符号/函数/超出安全折叠范围 → `None`（判不了）。
+
+    **不执行求值器**，只做小规模常量折叠。指数超过 `_FOLD_EXP_LIMIT` 时不折叠——
+    那是 TD1 的地盘（刻意冻结），这里不越界去改它。
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        inner = _const_number(node.operand)
+        if inner is None:
+            return None
+        return inner if isinstance(node.op, ast.UAdd) else -inner
+    if not isinstance(node, ast.BinOp):
+        return None
+    left = _const_number(node.left)
+    right = _const_number(node.right)
+    if left is None or right is None:
+        return None
+    try:
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            if _digits_of_number(left) + _digits_of_number(right) > config.SANDBOX_MAX_RESULT_DIGITS:
+                return None  # 折叠本身上界已超限：交给 _digits_upper 判，不真算
+            return left * right
+        if isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            if right == 0:
+                return None
+            return left / right
+        if isinstance(node.op, ast.Pow):
+            if not isinstance(right, int) or right < 0 or right > _FOLD_EXP_LIMIT:
+                return None
+            if _digits_of_number(left) * max(right, 1) > config.SANDBOX_MAX_RESULT_DIGITS:
+                return None
+            return left**right
+    except (OverflowError, ValueError, ZeroDivisionError, MemoryError):
+        return None
+    return None
+
+
+#: 常量折叠的指数上限（很小：只为算 `10*30` 这类中间量，不为算 `2**1000`）
+_FOLD_EXP_LIMIT = 64
+
+
+def _digits_of_number(value: int | float) -> int:
+    if isinstance(value, int):
+        return len(str(abs(value))) if value else 1
+    return 18  # float 的有效十进制位数量级
+
+
+def _digits_upper(node: ast.AST) -> int | None:
+    """**静态答案位数上界**（审查 必7）。
+
+    宽松上界，不真求值。`None` = 判不了（含符号 / 函数调用 / 折叠区间外），
+    **一律放行**——宁可让超时兜底，也不要误杀合法数学。
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return _digits_of_number(value)
+
+    if isinstance(node, ast.UnaryOp):
+        return _digits_upper(node.operand)
+
+    if isinstance(node, ast.BinOp):
+        left = _digits_upper(node.left)
+        right = _digits_upper(node.right)
+        if isinstance(node.op, (ast.Add, ast.Sub)):
+            if left is None or right is None:
+                return None
+            return max(left, right) + 1
+        if isinstance(node.op, ast.Mult):
+            if left is None or right is None:
+                return None
+            return left + right
+        if isinstance(node.op, ast.Div):
+            return left  # 除法不放大位数
+        if isinstance(node.op, (ast.FloorDiv, ast.Mod)):
+            if left is None or right is None:
+                return None
+            return max(left, right)
+        if isinstance(node.op, ast.Pow):
+            return _pow_digits_upper(node.left, node.right, left)
+    return None
+
+
+def _pow_digits_upper(base: ast.AST, exponent: ast.AST, base_digits: int | None) -> int | None:
+    """`a ** b` 的位数上界：`ceil(b * log10(|a|)) + 1`。
+
+    `a` 判不了（含符号）→ `None`（不拦）；`b` 不是小整数常量 → `None`。
+    """
+    if base_digits is None:
+        return None
+    exponent_value = _const_number(exponent)
+    if not isinstance(exponent_value, int) or exponent_value < 0:
+        return None
+    if exponent_value == 0:
+        return 1
+    base_value = _const_number(base)
+    if base_value is None:
+        return None
+    magnitude = abs(base_value)
+    if magnitude <= 1:
+        return 1
+    if exponent_value > _HUGE_DIGITS:
+        return _HUGE_DIGITS
+    try:
+        digits = exponent_value * math.log10(magnitude) + 1
+    except (OverflowError, ValueError):
+        return _HUGE_DIGITS
+    if not math.isfinite(digits):
+        return _HUGE_DIGITS
+    return int(digits) + 1
+
+
 def _pow_depth(node: ast.AST) -> int:
     depth = 0
     while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
@@ -183,15 +310,23 @@ def _check_semantics(
 
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name):
-            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:{_type_name(node.func)}")
+            return (
+                Verdict.REJECTED,
+                f"{Reason.FORBIDDEN_CALL.value}:{CALL_KIND_DANGER}:{_type_name(node.func)}",
+            )
         if node.func.id not in FUNCTION_NAMES:
-            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:{node.func.id}")
+            # **用不支持的数学 API ≠ 尝试逃逸**（审查 必5）：前者不计入 M17
+            kind = CALL_KIND_MATH_API if node.func.id in MATH_API_CALLS else CALL_KIND_DANGER
+            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:{kind}:{node.func.id}")
         if node.keywords:
-            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:keyword")
+            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:{CALL_KIND_DANGER}:keyword")
         if any(isinstance(arg, ast.Starred) for arg in node.args):
-            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:starred")
+            return (
+                Verdict.REJECTED,
+                f"{Reason.FORBIDDEN_CALL.value}:{CALL_KIND_DANGER}:starred",
+            )
         if len(node.args) > 2:  # log(x, base) 最多两个
-            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:arity")
+            return (Verdict.REJECTED, f"{Reason.FORBIDDEN_CALL.value}:{CALL_KIND_DANGER}:arity")
     return None
 
 
@@ -237,4 +372,11 @@ def static_check(expr: str, symbols: frozenset[str] | None = None) -> tuple[Verd
         bad = _check_semantics(node, known, called)
         if bad is not None:
             return bad
+
+    # 必7：**在执行之前**判"答案有几位"。放在语义检查之后、执行之前：
+    # 语义错（逃逸/不支持）优先，因为它更具体；位数是最后一层容量闸。
+    digits = _digits_upper(tree.body)
+    if digits is not None and digits > config.SANDBOX_MAX_RESULT_DIGITS:
+        # 容量不是能力（ADR-018）→ unsupported，不进 M17
+        return (Verdict.UNSUPPORTED, f"{Reason.NOT_REPRESENTABLE.value}:digits={digits}")
     return None

@@ -125,6 +125,15 @@ def _classify(
         return SandboxResult(verdict=Verdict.UNSUPPORTED, reason=Reason.SYMBOLIC.value, **common)
     if kind == "undefined":
         return SandboxResult(verdict=Verdict.UNSUPPORTED, reason=Reason.UNDEFINED.value, **common)
+    if kind == "too_large":
+        # 必8：超大整数**不是** non_finite。它是容量边界（ADR-018），不进 M17。
+        digits = payload.get("digits")
+        label = f"digits={digits}" if digits else "digits>=309"
+        return SandboxResult(
+            verdict=Verdict.UNSUPPORTED,
+            reason=f"{Reason.NOT_REPRESENTABLE.value}:{label}",
+            **common,
+        )
     # non_numeric：无法转成数值
     return SandboxResult(verdict=Verdict.UNSUPPORTED, reason=Reason.NON_NUMERIC.value, **common)
 

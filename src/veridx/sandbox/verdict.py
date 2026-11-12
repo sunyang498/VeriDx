@@ -68,6 +68,9 @@ class Reason(StrEnum):
     PARSE_ERROR = "parse_error"  # 语法错但无危险结构
     EMPTY_EXPR = "empty_expr"
     NOT_A_STRING = "not_a_string"  # 调用方类型 bug
+    #: 答案位数超出可表示范围（审查 必7/必8）：`not_representable:digits=5403`。
+    #: **容量**不是能力 → `unsupported`，不计入 M17。
+    NOT_REPRESENTABLE = "not_representable"
 
     # --- 运行时（→ timeout / error）---
     EVAL_TIMEOUT = "eval_timeout"
@@ -105,6 +108,7 @@ UNSUPPORTED_REASONS: frozenset[str] = frozenset(
         Reason.PARSE_ERROR.value,
         Reason.EMPTY_EXPR.value,
         Reason.NOT_A_STRING.value,
+        Reason.NOT_REPRESENTABLE.value,
     }
 )
 
@@ -113,13 +117,48 @@ ERROR_REASONS: frozenset[str] = frozenset(
     {Reason.SPAWN_FAILED.value, Reason.EVAL_ERROR.value, Reason.INTERNAL.value}
 )
 
+#: 调用白名单之外的名字分两类（审查 必5）：**用不支持的数学 API ≠ 尝试逃逸**
+MATH_API_CALLS: frozenset[str] = frozenset(
+    {
+        "fib",
+        "fibonacci",
+        "factorial",
+        "integrate",
+        "integral",
+        "solve",
+        "solveset",
+        "diff",
+        "limit",
+        "summation",
+        "product",
+        "Matrix",
+        "nsimplify",
+        "simplify",
+        "factor",
+        "expand",
+        "series",
+    }
+)
+
+#: `forbidden_call` 的第二段：`danger` 计入 M17，`math_api` 不计
+CALL_KIND_DANGER = "danger"
+CALL_KIND_MATH_API = "math_api"
+
 
 def reason_prefix(reason: str) -> str:
     return reason.split(":", 1)[0]
 
 
 def is_capability(reason: str) -> bool:
-    return reason_prefix(reason) in CAPABILITY_REASONS
+    """**M17 的唯一判据**：这次拒绝是否说明"输入具备能力"。
+
+    `forbidden_call:math_api:*` 是"模型用了一个我们没实现的数学函数"——
+    那是能力边界，不是恶意（`unsupported ≠ malicious`）。
+    """
+    parts = reason.split(":")
+    if parts[0] == Reason.FORBIDDEN_CALL.value and len(parts) > 1:
+        return parts[1] != CALL_KIND_MATH_API
+    return parts[0] in CAPABILITY_REASONS
 
 
 @dataclass(frozen=True)

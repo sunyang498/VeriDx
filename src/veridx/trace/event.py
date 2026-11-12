@@ -44,7 +44,11 @@ class ReasonCode(StrEnum):
     SANDBOX_UNSUPPORTED = "sandbox_unsupported"
     TOOL_ERROR = "tool_error"
     SCHEMA_INVALID = "schema_invalid"
-    #: C-19（P1.6 审查 🟡C 新增，待登记）：按**阶段**拆开，一个 code 一个含义。
+    #: C-21（审查 必6 新增，待登记）：答案超出可表示范围 —— **能力边界，不是格式错**。
+    #: 录数据的人看到 `String should have at most 256 characters` 会去查引号与编码，
+    #: 而真实原因是"这道题的答案有 20 万位"。
+    ANSWER_UNREPRESENTABLE = "answer_unrepresentable"
+    #: C-19（P1.6 审查 🟡C）：**按阶段拆开**，一个 code 一个含义。
     #: 原来 `schema_invalid` 同时映射到 escalated 与 uncertain 两种终态，
     #: 按 reason_code 分组统计时会把两类完全不同的失败混进同一组。
     DIAGNOSE_SCHEMA_INVALID = "diagnose_schema_invalid"
