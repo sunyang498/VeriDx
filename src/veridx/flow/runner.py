@@ -51,6 +51,7 @@ from veridx.guard.evidence import (
     LedgerEntry,
     bind_claims,
     capability_gap,
+    evidence_binding_of,
     reserve_claim_seqs,
 )
 from veridx.guard.injection import scan_untrusted
@@ -182,6 +183,8 @@ class Runner:
         self._reason: str | None = None
         self._blind: BlindSolveOutcome | None = None
         self._escalation_kind: EscalationKind | None = None
+        #: 诊断阶段的真实重试次数（`None` = 还没走到 diagnose，别用 0 假装"没重试过"）
+        self._schema_retries: int | None = None
         self.notes: list[str] = []
         self.ctx = ToolContext(run_id=self.run_id, conn=conn)
 
@@ -460,6 +463,8 @@ class Runner:
         except StructuredOutputError as exc:
             self.notes.append(f"diagnose_failed:{exc.errors[:2]}")
             self._finish(Terminal.ESCALATED, ReasonCode.DIAGNOSE_SCHEMA_INVALID.value)
+        # 真实重试次数 = 尝试次数 - 1（trace 里每次尝试都是独立事件，这里只是给 SSE 一个数）
+        self._schema_retries = max(len(result.attempts) - 1, 0)
         self._spend(result.usage_total)
         return result.model if isinstance(result.model, DiagnoseDraft) else DiagnoseDraft(**result.data)
 
@@ -492,6 +497,44 @@ class Runner:
             self._finish(Terminal.ESCALATED, ReasonCode.INSUFFICIENT_EVIDENCE.value)
         return claims, decision
 
+    def _guard_detail(
+        self, decision: BindingDecision, *, claims: list[ClaimWithSeq], stage: str
+    ) -> dict[str, Any]:
+        """guard 事件的 detail：**三个判据各写各的**，SSE 只做搬运（B-1）。
+
+        `_trace_guard` 与 `_check_confidence` 都走这里 —— 两处各写一份就会出现
+        "低置信度那次 guard 事件没有 accepted/rejected"，界面于是把它当成"通过"。
+        """
+        accepted = len(decision.accepted)
+        rejected = len(decision.rejected)
+        return {
+            "stage": stage,
+            "escalate": decision.escalate,
+            "escalation_kind": decision.escalation_kind.value if decision.escalation_kind else None,
+            "accepted": accepted,
+            "rejected": rejected,
+            "schema": "retry" if (self._schema_retries or 0) > 0 else "pass",
+            "schema_retries": self._schema_retries,
+            "evidence_binding": evidence_binding_of(decision),
+            "violations": [[field.value, reason.value] for field, reason in decision.violations],
+            "confidence_cap": decision.confidence_cap,
+            "needs_review": decision.needs_review,
+            "claim_seqs": [item.seq for item in claims],
+            "evidence_seqs": [entry.evidence.seq for entry in self._ledger()],
+            # 审查 🟡G：escalated 不写 diagnoses 行，M5（证据绑定通过率）与 F3/F4
+            # 细分必须能从 trace 重算 —— 所以 claims 的内容也要落 trace
+            "claims": [
+                {
+                    "field": item.claim.field.value,
+                    "value": _brief(item.claim.value),
+                    "evidence_ids": list(item.claim.evidence_ids),
+                    "seq": item.seq,
+                    "accepted": _was_accepted(decision, item),
+                }
+                for item in claims
+            ],
+        }
+
     def _trace_guard(
         self,
         decision: BindingDecision,
@@ -504,30 +547,7 @@ class Runner:
             NodeName.GUARD.value,
             status=NodeStatus.OK if not decision.escalate else NodeStatus.FAIL,
             reason_code=ReasonCode.INSUFFICIENT_EVIDENCE.value if decision.escalate else None,
-            detail={
-                "stage": stage,
-                "escalate": decision.escalate,
-                "escalation_kind": decision.escalation_kind.value if decision.escalation_kind else None,
-                "accepted": len(decision.accepted),
-                "rejected": len(decision.rejected),
-                "violations": [[field.value, reason.value] for field, reason in decision.violations],
-                "confidence_cap": decision.confidence_cap,
-                "needs_review": decision.needs_review,
-                "claim_seqs": [item.seq for item in claims],
-                "evidence_seqs": [entry.evidence.seq for entry in self._ledger()],
-                # 审查 🟡G：escalated 不写 diagnoses 行，M5（证据绑定通过率）与 F3/F4
-                # 细分必须能从 trace 重算 —— 所以 claims 的内容也要落 trace
-                "claims": [
-                    {
-                        "field": item.claim.field.value,
-                        "value": _brief(item.claim.value),
-                        "evidence_ids": list(item.claim.evidence_ids),
-                        "seq": item.seq,
-                        "accepted": _was_accepted(decision, item),
-                    }
-                    for item in claims
-                ],
-            },
+            detail=self._guard_detail(decision, claims=claims, stage=stage),
             item_id=item_id,
         )
 
@@ -546,6 +566,7 @@ class Runner:
                 status=NodeStatus.FAIL,
                 reason_code=ReasonCode.LOW_CONFIDENCE.value,
                 detail={
+                    **self._guard_detail(decision, claims=[], stage="confidence"),
                     "confidence": effective,
                     "theta": config.CONFIDENCE_THETA,
                     "escalation_kind": self._escalation_kind.value,

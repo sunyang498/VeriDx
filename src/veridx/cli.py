@@ -41,6 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
     export = contract_sub.add_parser("export", help="导出 openapi.json")
     export.add_argument("--out", default=None, help="输出路径（默认 doc/openapi.json）")
     export.add_argument("--check", action="store_true", help="只校验导出文件是否与代码一致")
+
+    run = sub.add_parser("run", help="跑一题并打印终态 / 证据 / trace 位置")
+    run.add_argument("--case", default=None, help="题目 id（先查 datasets/，再查数据库）")
+    run.add_argument("--db", default=None, help="数据库路径（默认取 VERIDX_DB_PATH）")
+    mode = run.add_mutually_exclusive_group()
+    mode.add_argument("--mock", action="store_true", help="强制脚本 provider（离线、确定性）")
+    mode.add_argument("--real", action="store_true", help="强制真模型（必须有 key）")
+    run.add_argument("--student", default=None, help="覆盖学生答案（默认取样本/最近一次作答）")
+    run.add_argument("--out", default=None, help="把结果写成 JSON")
+    run.add_argument("--no-explain", action="store_true", help="跳过讲解节点（省一次调用）")
+
+    replay = sub.add_parser("replay", help="打印某次 run 的 trace 时间线")
+    replay.add_argument("run_id", help="run_id（`veridx run` 会打印）")
+    replay.add_argument("--db", default=None, help="数据库路径（默认取 VERIDX_DB_PATH）")
+    replay.add_argument("--at", type=int, default=None, help="只看第 N 条事件的完整输入")
+    replay.add_argument("--diff", default=None, help="与另一个 run 对比节点序列")
     return parser
 
 
@@ -113,6 +129,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_serve(args.host, args.port, args.reload)
     if args.command == "contract" and args.contract_command == "export":
         return cmd_contract_export(args.out, args.check)
+    if args.command == "run":
+        from veridx import cli_ops
+
+        return cli_ops.cmd_run(
+            case_id=args.case,
+            db_path=args.db,
+            mock=args.mock,
+            real=args.real,
+            student=args.student,
+            out=args.out,
+            explain=not args.no_explain,
+        )
+    if args.command == "replay":
+        from veridx import cli_ops
+
+        return cli_ops.cmd_replay(run_id=args.run_id, db_path=args.db, at=args.at, diff=args.diff)
     build_parser().print_help()
     return 0
 

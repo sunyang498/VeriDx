@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { createAttempt, getDiagnosis, getHealth, getTask, startDiagnose, streamTask } from './api'
+import { durationText, evidenceView, guardView, terminalMessage } from './view'
 
 const PRESETS = [
   { label: '分数加法', stem: '计算 1/2 + 1/3，结果写成最简分数。', correct: '5/6', student: '5/7' },
@@ -27,12 +28,26 @@ const health = ref('连接中…')
 const ok = ref(false)
 const stages = ref([])
 const evidence = ref([])
-const guard = ref('')
+const guard = ref({ label: '', detail: '', level: 'unknown' })
 const result = ref(null)
 const diagnosis = ref(null)
 
 const badge = computed(() =>
   result.value ? LABELS[result.value.terminal] || result.value.terminal : '',
+)
+const terminalNote = computed(() =>
+  result.value
+    ? terminalMessage(result.value.terminal, result.value.reason_code, result.value.run_id)
+    : '',
+)
+const elapsed = computed(() => (result.value ? durationText(result.value.ms) : ''))
+// 有诊断就用库里的完整证据表，没有就用流里收到的（failed / escalate 时仍然可见）
+const evidenceCards = computed(() =>
+  (diagnosis.value ? diagnosis.value.evidence : evidence.value).map((e) => ({
+    id: e.id,
+    produced_by: e.produced_by,
+    ...evidenceView(e),
+  })),
 )
 
 function preset(index) {
@@ -46,7 +61,7 @@ function reset() {
   error.value = ''
   stages.value = []
   evidence.value = []
-  guard.value = ''
+  guard.value = { label: '', detail: '', level: 'unknown' }
   result.value = null
   diagnosis.value = null
 }
@@ -61,9 +76,14 @@ function onFrame(frame) {
   } else if (frame.event === 'evidence') {
     evidence.value.push(d)
   } else if (frame.event === 'guard') {
-    guard.value = d.schema === 'pass' ? '证据绑定通过' : '证据绑定未通过 → 转人工'
+    guard.value = guardView(d)
   } else if (frame.event === 'done') {
-    result.value = { terminal: d.terminal, reason_code: d.reason_code, ms: d.latency_ms }
+    result.value = {
+      terminal: d.terminal,
+      reason_code: d.reason_code,
+      ms: d.latency_ms,
+      run_id: d.run_id,
+    }
   }
 }
 
@@ -95,6 +115,7 @@ async function run() {
       terminal: final.terminal,
       reason_code: final.reason_code,
       ms: result.value ? result.value.ms : null,
+      run_id: final.run_id,
     }
     if (final.diagnosis_id) diagnosis.value = await getDiagnosis(final.diagnosis_id)
   } catch (e) {
@@ -153,11 +174,14 @@ onMounted(async () => {
         <div v-if="result" class="terminal" :class="result.terminal">
           <b>{{ badge }}</b>
           <span v-if="result.reason_code">reason: {{ result.reason_code }}</span>
-          <span v-else-if="result.terminal === 'diagnosed'">证据绑定通过</span>
-          <span v-if="result.ms">· {{ (result.ms / 1000).toFixed(1) }}s</span>
+          <span v-if="elapsed">{{ elapsed }}</span>
         </div>
 
-        <p v-if="guard" class="muted">{{ guard }}</p>
+        <p v-if="terminalNote" class="muted">{{ terminalNote }}</p>
+
+        <p v-if="guard.label" class="muted" :class="'binding-' + guard.level">
+          {{ guard.label }}<template v-if="guard.detail"> · {{ guard.detail }}</template>
+        </p>
 
         <div v-if="diagnosis">
           <dl class="kv">
@@ -195,26 +219,45 @@ onMounted(async () => {
           </div>
 
           <h3>程序证据</h3>
-          <div v-for="e in diagnosis.evidence" :key="e.id" class="claim">
+          <div v-for="e in evidenceCards" :key="e.id" class="claim">
             <div class="row">
-              <b>{{ e.id }}</b>
-              <span>{{ e.kind }} · {{ e.status }} · by {{ e.produced_by }}</span>
+              <b>{{ e.title }}</b>
+              <span v-if="e.produced_by">by {{ e.produced_by }}</span>
             </div>
-            <pre>{{ JSON.stringify(e.payload, null, 2) }}</pre>
+            <dl class="kv">
+              <template v-for="f in e.fields" :key="f.label">
+                <dt>{{ f.label }}</dt>
+                <dd>{{ f.value }}</dd>
+              </template>
+            </dl>
+            <details>
+              <summary>原始数据</summary>
+              <pre>{{ e.raw }}</pre>
+            </details>
           </div>
         </div>
 
-        <!-- 没产出诊断时也要展示：程序证据已经产生，只是结论立不住（能力边界） -->
-        <div v-else-if="result && evidence.length">
+        <!-- 没产出诊断也要展示：程序证据已经产生，只是结论立不住（能力边界 / failed） -->
+        <div v-else-if="evidenceCards.length">
           <h3>本次收集到的程序证据</h3>
-          <div v-for="e in evidence" :key="e.id" class="claim">
-            <div class="row">
-              <b>{{ e.id }}</b>
-              <span>{{ e.kind }} · {{ e.status }}</span>
-            </div>
-            <pre>{{ JSON.stringify(e.payload, null, 2) }}</pre>
+          <div v-for="e in evidenceCards" :key="e.id" class="claim">
+            <div class="row"><b>{{ e.title }}</b></div>
+            <dl class="kv">
+              <template v-for="f in e.fields" :key="f.label">
+                <dt>{{ f.label }}</dt>
+                <dd>{{ f.value }}</dd>
+              </template>
+            </dl>
+            <details>
+              <summary>原始数据</summary>
+              <pre>{{ e.raw }}</pre>
+            </details>
           </div>
         </div>
+
+        <p v-else-if="result && !running" class="muted">
+          本次没有产出程序证据（{{ result.terminal }}）。可用 run_id {{ result.run_id || '—' }} 回放排查。
+        </p>
 
         <p v-else-if="!running && !result" class="muted center">
           左侧填一道错题并点「开始诊断」，过程与证据会实时出现在这里。

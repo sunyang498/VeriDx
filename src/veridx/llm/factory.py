@@ -65,14 +65,21 @@ def build_provider(
     mode: str | None = None,
     responses: list[str] | None = None,
     transport: Any = None,
+    blind_answer: str | None = None,
 ) -> LLMProvider:
-    """构造 provider。`role="second"` 走第二模型（分支 B 闸 2 / judge）。"""
+    """构造 provider。`role="second"` 走第二模型（分支 B 闸 2 / judge）。
+
+    `blind_answer` 只对 mock 生效：离线 smoke 时把"盲解"脚本成答案键
+    （题干不是纯算式时，脚本 provider 本来就算不出来）。
+    """
     resolved_mode = resolve_mode(role=role, mode=mode)
     _mode, model, base_url, api_key = _settings_for(role)
 
     if resolved_mode == "mock":
         # `mock` 模式下用**按提示词分派**的 provider：整条流水线能真跑通（离线演示/CI）
-        return ScenarioMockProvider(name=f"scenario-mock:{role}", model=f"mock-{role}")
+        return ScenarioMockProvider(
+            name=f"scenario-mock:{role}", model=f"mock-{role}", blind_answer=blind_answer
+        )
 
     return OpenAICompatProvider(
         model=model,

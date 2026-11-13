@@ -35,6 +35,10 @@ _LEGACY_STEM = re.compile(r"【题干】\s*\n(.+)")
 class ScenarioMockProvider:
     name: str = "scenario-mock"
     model: str = "scenario-mock"
+    #: 脚本化的"盲解答案"。`None` = 尽量从题干里算出算术子串（见 `_extract_expected`）；
+    #: 显式给值只用于离线 smoke（`veridx run --mock`）——题干不是纯算式时，
+    #: 让脚本 provider 扮演"会做题的模型"，而不是假装算出了积分。
+    blind_answer: str | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
     total_usage: Usage = field(default_factory=Usage)
 
@@ -64,7 +68,7 @@ class ScenarioMockProvider:
         if "独立求解" in prompt:
             return json.dumps(
                 {
-                    "answer": _extract_expected(prompt),
+                    "answer": self.blind_answer or _extract_expected(prompt),
                     "steps": ["先化简", "再代入"],
                     "confidence": 0.9,
                     "note": "",

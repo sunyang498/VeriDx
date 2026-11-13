@@ -58,7 +58,9 @@ __all__ = [
     "OverEscalationReport",
     "allocate_claim",
     "bind_claims",
+    "binding_label",
     "capability_gap",
+    "evidence_binding_of",
     "over_escalation",
     "over_escalation_from_outcomes",
     "reserve_claim_seqs",
@@ -138,6 +140,26 @@ class BindingDecision:
             if verdict.accepted and verdict.claim.field is name:
                 return verdict.claim.value
         return None
+
+
+#: 证据绑定的三档口径（C-33）。**一个布尔撑不起三个字段**：
+#: 全部通过 / 部分通过 / 未通过 是三种不同的产品事实，"部分通过"必须可见。
+BINDING_PASS = "pass"
+BINDING_PARTIAL = "partial"
+BINDING_FAIL = "fail_after_retry"
+
+
+def binding_label(accepted: int, rejected: int, *, escalate: bool) -> str:
+    """三档口径的**唯一实现**。trace 写入与 SSE 派生都调它，不允许各写一份。"""
+    if escalate:
+        return BINDING_FAIL
+    if rejected == 0:
+        return BINDING_PASS if accepted > 0 else BINDING_FAIL
+    return BINDING_PARTIAL if accepted > 0 else BINDING_FAIL
+
+
+def evidence_binding_of(decision: BindingDecision) -> str:
+    return binding_label(len(decision.accepted), len(decision.rejected), escalate=decision.escalate)
 
 
 def allocate_claim(claim: Claim, next_seq: Callable[[], int]) -> ClaimWithSeq:

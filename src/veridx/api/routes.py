@@ -23,6 +23,7 @@ from veridx.api.errors import ApiError, ErrorCode, not_implemented
 from veridx.api.jobs import JobManager, job_spec_from
 from veridx.api.stream import sse_frame
 from veridx.clock import new_id
+from veridx.guard.evidence import binding_label
 from veridx.sched.fingerprint import fingerprint
 from veridx.store import db as store_db
 from veridx.store.repository import RepositoryError, map_integrity_error
@@ -319,7 +320,7 @@ def _trace_frames(conn: sqlite3.Connection, task: Any, *, after: int) -> Iterato
                         terminal=S.Terminal(task["terminal"]),
                         reason_code=task["reason_code"],
                         run_id=run_id,
-                        latency_ms=int((time.monotonic() - started) * 1000),
+                        latency_ms=_task_latency_ms(task),
                         tokens=S.TokenUsage(
                             input_tokens=task["tokens_in"] or 0,
                             output_tokens=task["tokens_out"] or 0,
@@ -356,16 +357,48 @@ def _trace_frames(conn: sqlite3.Connection, task: Any, *, after: int) -> Iterato
         time.sleep(_STREAM_POLL_SECONDS)
 
 
+def _task_latency_ms(task: Any) -> int | None:
+    """任务的真实耗时（`updated_at - created_at`）。
+
+    两个时间戳都是**秒级**，所以亚秒级 run 会算出 0 —— 此时返回 `None`：
+    **"拿不到" 和 "确实是 0ms" 必须能区分**，否则界面上的 `· 0.0s`
+    会让人以为"秒失败 = 参数错"（B-2 实测就是这个坑）。
+    """
+    from datetime import datetime
+
+    try:
+        created = datetime.fromisoformat(str(task["created_at"]))
+        updated = datetime.fromisoformat(str(task["updated_at"]))
+    except (TypeError, ValueError):
+        return None
+    delta_ms = int((updated - created).total_seconds() * 1000)
+    return delta_ms if delta_ms > 0 else None
+
+
 def _event_frames(row: Any, next_seq: Callable[[], int]) -> Iterator[str]:
     detail = json.loads(row["detail"] or "{}")
     if row["node"] == "guard":
-        escalate = detail.get("escalate")
+        # 三个字段分别取真实值（C-33）。老行没有 `schema`/`schema_retries` 就发 `null`，
+        # **绝不用"escalate ? fail : pass"顶替** —— 那正是"一个布尔冒充三个判断"的来源。
+        accepted = detail.get("accepted")
+        rejected = detail.get("rejected")
+        total = int(accepted) + int(rejected) if accepted is not None and rejected is not None else None
+        escalate = bool(detail.get("escalate"))
+        binding = detail.get("evidence_binding")
+        if not isinstance(binding, str):
+            binding = (
+                binding_label(int(accepted or 0), int(rejected or 0), escalate=escalate)
+                if accepted is not None and rejected is not None
+                else ("fail_after_retry" if escalate else "pass")
+            )
         yield sse_frame(
             S.SSEEventName.GUARD,
             S.GuardEventData(
-                schema="fail" if escalate else "pass",
-                evidence_binding="fail_after_retry" if escalate else "pass",
-                retries=int(detail.get("retries", 0) or 0),
+                schema=detail.get("schema"),
+                evidence_binding=S.EvidenceBinding(binding),
+                retries=detail.get("schema_retries"),
+                accepted=accepted,
+                total=total,
             ),
         )
         return

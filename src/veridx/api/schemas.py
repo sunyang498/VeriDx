@@ -74,6 +74,9 @@ class TaskStatus(StrEnum):
 
 class EvidenceBinding(StrEnum):
     PASS = "pass"
+    #: C-33（本次新增，待登记）：**部分通过** —— 有断言立住也有断言没立住。
+    #: 以前这一档被"一个布尔"吞掉，界面上显示成"通过"，等于把卖点变成话术。
+    PARTIAL = "partial"
     FAIL_AFTER_RETRY = "fail_after_retry"
     SKIPPED = "skipped"
 
@@ -453,9 +456,20 @@ class TokenEventData(StrictModel):
 
 
 class GuardEventData(StrictModel):
-    schema_: Literal["pass", "fail", "retry"] = Field(alias="schema")
+    """三个**互相独立**的判据，不是一个布尔的三个分身。
+
+    * `schema`           —— 模型输出有没有通过 schema 校验（`retry` = 重试后通过）
+    * `evidence_binding` —— 断言有没有被证据撑住（`pass` / `partial` / `fail_after_retry`）
+    * `retries`          —— **真实**重试次数；老数据没有这个字段时是 `null`，不是 0
+
+    `accepted` / `total` 是给界面显示"1/2 条断言有证据"用的；拿不到就是 `null`。
+    """
+
+    schema_: Literal["pass", "fail", "retry"] | None = Field(default=None, alias="schema")
     evidence_binding: EvidenceBinding
-    retries: int = Field(default=0, ge=0)
+    retries: int | None = Field(default=None, ge=0)
+    accepted: int | None = Field(default=None, ge=0)
+    total: int | None = Field(default=None, ge=0)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -471,7 +485,9 @@ class DoneEventData(StrictModel):
     terminal: Terminal
     reason_code: str | None = None
     run_id: str
-    latency_ms: int = Field(ge=0)
+    #: C-34（本次变更，待登记）：**`null` = 拿不到耗时**，不许拿"流的存活时间"冒充
+    #: （前端据此不显示 `· 0.0s`，而不是显示一个看起来像事实的 0）
+    latency_ms: int | None = Field(default=None, ge=0)
     tokens: TokenUsage
 
 
