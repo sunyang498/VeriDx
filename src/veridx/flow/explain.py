@@ -76,6 +76,8 @@ class Explanation:
     degraded: bool = False
     reason: str | None = None
     usage_total: int = 0
+    usage_in: int = 0
+    usage_out: int = 0
 
     @property
     def teaching_only(self) -> list[ExplanationStep]:
@@ -211,6 +213,8 @@ async def explain(
             degraded=True,
             reason="explain_too_few_steps",
             usage_total=result.usage_total,
+            usage_in=result.usage_in,
+            usage_out=result.usage_out,
         )
 
     if tracer is not None:
@@ -227,7 +231,9 @@ async def explain(
             },
             item_id=item_id,
         )
-    return Explanation(steps=steps, usage_total=result.usage_total)
+    return Explanation(
+        steps=steps, usage_total=result.usage_total, usage_in=result.usage_in, usage_out=result.usage_out
+    )
 
 
 def _trace_degraded(

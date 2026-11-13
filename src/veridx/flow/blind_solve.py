@@ -52,6 +52,10 @@ from veridx.sandbox import Comparison, compare
 from veridx.trace.event import NodeName, NodeStatus, ReasonCode
 from veridx.trace.recorder import TraceRecorder
 
+#: 防伪码长度与字符集（`prompts.fence.new_nonce` = `secrets.token_hex(8)` = 16 hex）
+_NONCE_LEN = 16
+_HEX_CHARS = frozenset("0123456789abcdef")
+
 __all__ = [
     "BlindDraft",
     "BlindSolveOutcome",
@@ -119,6 +123,8 @@ class BlindSolveOutcome:
     equal_student_key: bool | None = None
     notes: list[str] = field(default_factory=list)
     usage_total: int = 0
+    usage_in: int = 0
+    usage_out: int = 0
     prompt_version: str = prompt.VERSION
     prompt_hash: str = ""
 
@@ -198,6 +204,8 @@ async def blind_solve(
     outcome.model_answer = draft.answer.strip()
     outcome.steps = list(draft.steps)
     outcome.usage_total = result.usage_total
+    outcome.usage_in = result.usage_in
+    outcome.usage_out = result.usage_out
 
     outcome.equal_model_key = _equal(outcome.model_answer, correct_answer, symbols)
     outcome.equal_model_student = _equal(outcome.model_answer, student_answer, symbols)
@@ -289,6 +297,8 @@ async def _run_gates(
 
     draft = second.model if isinstance(second.model, BlindDraft) else BlindDraft(**second.data)
     outcome.usage_total += second.usage_total
+    outcome.usage_in += second.usage_in
+    outcome.usage_out += second.usage_out
     outcome.second_answer = draft.answer.strip() or None
     # 闸 2 也必须是 sympy 判等：第二个模型说"一样"不算
     agreed = _equal(outcome.second_answer or "", outcome.model_answer, symbols)
@@ -332,6 +342,31 @@ def _trace_l0(
         },
         item_id=item_id,
     )
+
+
+def collision_prob(answer: str, stem: str = "") -> float:
+    """答案被**防伪码**误伤的概率上界（TD4，实施单 §1）。纯函数：不打网络、不碰沙箱。
+
+    `_assert_no_leak` 是子串匹配：prompt 里有一段 16 位随机十六进制 nonce，
+    学生答案若全是 `0-9a-f` 且长度 ≤ 16，就有概率正好落在里面 → 抛 `ValueError`
+    → 整题 `failed/internal_error`。**这个缺陷已裁定保留到 P4**，
+    本函数不改行为，只把"多大概率"变成**可计算的数**。
+
+    口径（照实施单实现，别自己发明）：
+    * 空 / 在题干里 / 在模板里 → `0.0`（`_assert_no_leak` 本来就早退）
+    * 含 `0-9a-f` 之外的字符 → `0.0`（永不可能撞上）
+    * 全 hex、长度 L ≤ 16 → `1 - (1 - 16**-L) ** (17 - L)`（17-L 个位置各试一次）
+    * L > 16 → `0.0`（比 nonce 还长，不可能成为它的子串）
+    """
+    text = (answer or "").strip()
+    if not text or text in stem or text in prompt.template():
+        return 0.0
+    if any(char not in _HEX_CHARS for char in text):
+        return 0.0
+    if len(text) > _NONCE_LEN:
+        return 0.0
+    windows = _NONCE_LEN + 1 - len(text)
+    return 1 - (1 - 16 ** -len(text)) ** windows
 
 
 def _assert_no_leak(messages: list[dict[str, Any]], *, stem: str, student_answer: str) -> None:

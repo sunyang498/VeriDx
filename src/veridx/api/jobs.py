@@ -109,7 +109,7 @@ class JobManager:
             )
             result = await runner.run(spec)
             with contextlib.suppress(Exception):
-                repo.add_tokens(task_id, tokens_in=result.tokens, tokens_out=0)
+                repo.add_tokens(task_id, tokens_in=result.tokens_in, tokens_out=result.tokens_out)
             with contextlib.suppress(Exception):
                 repo.finish_task(task_id, result.terminal.value, reason_code=result.reason_code)
         except asyncio.CancelledError:

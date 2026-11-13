@@ -93,6 +93,9 @@ class StructuredResult:
     model: TModel
     attempts: list[dict[str, Any]] = field(default_factory=list)
     usage_total: int = 0
+    #: 输入/输出**必须分开**（实施单 §2）：`usage_total` 一个数回答不了"每道题花多少 token / 多少钱"
+    usage_in: int = 0
+    usage_out: int = 0
     parse: ParseOutcome | None = None
     degraded: bool = False
 
@@ -147,6 +150,8 @@ async def call_structured(
     conversation = list(messages)
     attempts: list[dict[str, Any]] = []
     usage_total = 0
+    usage_in = 0
+    usage_out = 0
     errors: list[str] = []
 
     # provider 选择依据必须可观察（否则"三种可切换"是假能力）
@@ -220,6 +225,8 @@ async def call_structured(
             continue
 
         usage_total += result.usage.total
+        usage_in += result.usage.input_tokens
+        usage_out += result.usage.output_tokens
         if budget is not None:
             budget.spend(result.usage.total)
 
@@ -273,6 +280,8 @@ async def call_structured(
                 model=model,
                 attempts=attempts,
                 usage_total=usage_total,
+                usage_in=usage_in,
+                usage_out=usage_out,
                 parse=parsed,
             )
 

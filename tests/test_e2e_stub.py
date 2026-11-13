@@ -77,7 +77,9 @@ def test_stub_path_end_to_end(client: TestClient) -> None:
 
 
 def test_diagnose_produces_a_real_diagnosis(client: TestClient) -> None:
-    attempt = _create_attempt(client, student_answer="35")
+    # 答案必须是"不可能撞上防伪码"的形状：`"35"` 全 hex，TD4（§3.1.6）会让本用例
+    # 以 ~5.7% 的概率整题 failed。这是**避开已知缺陷**，不是修它（修它属 P4）。
+    attempt = _create_attempt(client, student_answer="e-1")
     task_id = client.post(f"/api/v1/attempts/{attempt['attempt_id']}/diagnose").json()["task_id"]
     done = _wait_terminal(client, task_id)
     assert done["diagnosis_id"], f"没有产出诊断：{done}"

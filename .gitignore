@@ -52,3 +52,8 @@ web/*.tsbuildinfo
 /doc/delivery/
 /doc/review/
 /doc/面试/
+
+# ---- 评测产物（生成物：带时间戳与随机 run_id，不可复现；口径随报告头里的 version 变）----
+/eval/tmp/
+/eval/reports/*.json
+/eval/reports/*.md

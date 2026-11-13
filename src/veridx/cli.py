@@ -57,6 +57,19 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--db", default=None, help="数据库路径（默认取 VERIDX_DB_PATH）")
     replay.add_argument("--at", type=int, default=None, help="只看第 N 条事件的完整输入")
     replay.add_argument("--diff", default=None, help="与另一个 run 对比节点序列")
+
+    eval_parser = sub.add_parser("eval", help="批量跑题 + 自动汇总（CLI-only，C-32）")
+    eval_parser.add_argument("--suite", required=True, help="数据集（JSONL，一行一题）")
+    eval_parser.add_argument("--arms", default="A", help="实验臂，逗号分隔（当前只有 A）")
+    eval_parser.add_argument("--k", type=int, default=1, help="每题重复次数")
+    eval_parser.add_argument("--out", default=None, help="结果 JSON（默认 eval/reports/<时间>.json）")
+    eval_parser.add_argument("--limit", type=int, default=None, help="只跑前 N 题（自测用）")
+    eval_parser.add_argument("--db", default=None, help="数据库路径（默认 eval/tmp/<hash>-k<k>.db）")
+    eval_mode = eval_parser.add_mutually_exclusive_group()
+    eval_mode.add_argument("--mock", action="store_true", help="强制脚本 provider")
+    eval_mode.add_argument("--real", action="store_true", help="强制真模型")
+    eval_parser.add_argument("--no-explain", action="store_true", help="跳过讲解节点（省一次调用）")
+    eval_parser.add_argument("--no-reuse", action="store_true", help="不复用已有结果，强制重跑")
     return parser
 
 
@@ -145,6 +158,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         from veridx import cli_ops
 
         return cli_ops.cmd_replay(run_id=args.run_id, db_path=args.db, at=args.at, diff=args.diff)
+    if args.command == "eval":
+        from veridx import cli_eval
+
+        return cli_eval.cmd_eval(
+            suite=args.suite,
+            arms=args.arms,
+            k=args.k,
+            out=args.out,
+            limit=args.limit,
+            db_path=args.db,
+            mock=args.mock,
+            real=args.real,
+            explain=not args.no_explain,
+            reuse=not args.no_reuse,
+        )
     build_parser().print_help()
     return 0
 

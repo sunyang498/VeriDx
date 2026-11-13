@@ -1,0 +1,3 @@
+{"id": "q001", "course": "arithmetic", "stem": "计算 1/2 + 1/3，结果写成最简分数。", "correct": "5/6", "student": "5/7", "student_steps": null, "note": "分数加法：分母相加是典型错误"}
+{"id": "q002", "course": "arithmetic", "stem": "求 2^10 的值。", "correct": "1024", "student": "20", "student_steps": null, "note": "指数当成乘法"}
+{"id": "q007", "course": "calculus", "stem": "求 ∫_0^1 x·e^x dx 的值。", "correct": "1", "student": "e-1", "student_steps": null, "note": "设计文档 §10.3.2 的样例（分部积分符号错）"}

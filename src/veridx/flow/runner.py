@@ -131,6 +131,9 @@ class RunResult:
     evidence: list[LedgerEntry] = field(default_factory=list)
     llm_calls: int = 0
     tokens: int = 0
+    #: 实施单 §2：输入/输出分开（`tokens` 仍是总量，预算与旧调用方不变）
+    tokens_in: int = 0
+    tokens_out: int = 0
     latency_ms: int = 0
     #: 终态是因为"能力边界"还是"机制缺陷"（报告口径，§6.2）
     escalation_kind: EscalationKind | None = None
@@ -179,6 +182,8 @@ class Runner:
         self._started = clock()
         self._llm_calls = 0
         self._tokens = 0
+        self._tokens_in = 0
+        self._tokens_out = 0
         self._terminal: Terminal | None = None
         self._reason: str | None = None
         self._blind: BlindSolveOutcome | None = None
@@ -247,6 +252,8 @@ class Runner:
             evidence=list(self._ledger()),
             llm_calls=self._llm_calls,
             tokens=self._tokens,
+            tokens_in=self._tokens_in,
+            tokens_out=self._tokens_out,
             latency_ms=int((self.clock() - self._started) * 1000),
             escalation_kind=(
                 decision.escalation_kind if decision and decision.escalation_kind else self._escalation_kind
@@ -295,9 +302,13 @@ class Runner:
             )
             self._finish(Terminal.UNCERTAIN, ReasonCode.TIMED_OUT.value)
 
-    def _spend(self, usage_total: int) -> None:
+    def _spend(self, usage_total: int, *, usage_in: int = 0, usage_out: int = 0) -> None:
         self._llm_calls += 1
         self._tokens += max(usage_total, 0)
+        # 实施单 §2：输入/输出分开记。以前两个字段都填 `_tokens`（总量），
+        # 于是"这道题花了多少 token / 多少钱"的分析全是假的。
+        self._tokens_in += max(usage_in, 0)
+        self._tokens_out += max(usage_out, 0)
         self.budget.spend(max(usage_total, 0))
 
     # ---- 节点 1：parse ---------------------------------------------------
@@ -363,7 +374,7 @@ class Runner:
             # 必10：**一个请求都没发**。不许把它记成一次 LLM 调用。
             self.notes.append("budget_insufficient_before_call")
             self._finish(Terminal.UNCERTAIN, ReasonCode.SKIPPED_BUDGET.value)
-        self._spend(outcome.usage_total)
+        self._spend(outcome.usage_total, usage_in=outcome.usage_in, usage_out=outcome.usage_out)
         self._blind = outcome
 
         if outcome.branch is Branch.S_STUDENT_CORRECT:
@@ -465,7 +476,7 @@ class Runner:
             self._finish(Terminal.ESCALATED, ReasonCode.DIAGNOSE_SCHEMA_INVALID.value)
         # 真实重试次数 = 尝试次数 - 1（trace 里每次尝试都是独立事件，这里只是给 SSE 一个数）
         self._schema_retries = max(len(result.attempts) - 1, 0)
-        self._spend(result.usage_total)
+        self._spend(result.usage_total, usage_in=result.usage_in, usage_out=result.usage_out)
         return result.model if isinstance(result.model, DiagnoseDraft) else DiagnoseDraft(**result.data)
 
     def _evidence_block(self) -> str:
@@ -597,7 +608,11 @@ class Runner:
         )
         if "budget_insufficient_before_call" in (explanation.reason or ""):
             self.notes.append("budget_insufficient_before_call")
-        self._spend(explanation.usage_total)
+        self._spend(
+            explanation.usage_total,
+            usage_in=explanation.usage_in,
+            usage_out=explanation.usage_out,
+        )
         if explanation.degraded:
             # 降级阶梯第 1 档：只给结构化诊断，不报错
             self.notes.append(f"explain_degraded:{explanation.reason}")
@@ -673,8 +688,8 @@ class Runner:
                 evidence_binding=EvidenceBinding.PASS.value,
                 verify_agrees=blind.suspect is Suspect.CONFIRMED,
                 suspected_bad_answer_key=blind.suspect.value,
-                input_tokens=self._tokens,
-                output_tokens=self._tokens,
+                input_tokens=self._tokens_in,
+                output_tokens=self._tokens_out,
                 latency_ms=int((self.clock() - self._started) * 1000),
             )
             for item in decision.accepted:

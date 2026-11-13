@@ -25,7 +25,7 @@ from veridx.flow.runner import RunLimits, Runner, RunSpec
 from veridx.trace.event import NodeStatus, ReasonCode
 from veridx.trace.recorder import TraceRecorder
 
-__all__ = ["Case", "cmd_replay", "cmd_run", "load_case"]
+__all__ = ["Case", "cmd_replay", "cmd_run", "ensure_rows", "load_case"]
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def load_case(case_id: str, conn: sqlite3.Connection | None = None) -> Case | No
     )
 
 
-def _ensure_rows(conn: sqlite3.Connection, case: Case) -> tuple[dict[str, Any], dict[str, Any]]:
+def ensure_rows(conn: sqlite3.Connection, case: Case) -> tuple[dict[str, Any], dict[str, Any]]:
     """跑之前先把 question / attempt 落库：`diagnoses.attempt_id` 有外键，不能凭空写。"""
     from veridx.store.repository import Repository
 
@@ -200,7 +200,7 @@ async def _run_case(
     mode: str | None,
     explain: bool,
 ) -> Any:
-    question, attempt = _ensure_rows(conn, case)
+    question, attempt = ensure_rows(conn, case)
     # 离线 smoke：脚本 provider 扮演"会做题的模型"（盲解答案 = 答案键）。
     # 真模型下不给提示，`blind_answer` 被忽略。
     primary, second = _build_pair(mode, blind_answer=case.answer_key if mode == "mock" else None)
