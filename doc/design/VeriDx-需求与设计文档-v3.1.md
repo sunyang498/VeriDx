@@ -1,11 +1,12 @@
-# VeriDx（证诊）· 需求与设计文档 **v3.9**
+# VeriDx（证诊）· 需求与设计文档 **v3.10**
 
 > **项目英文名**：**VeriDx** ｜ **GitHub 仓库**：`veridx`
 > **中文代号**：**证诊**（证据驱动的诊断）
 > **一句话**：一个**验证优先（verification-first）**的错题诊断 Agent —— 模型的每一句结论都必须绑定程序产生的事实证据，否则不得进入终态。
 > **课题**：《基于大模型的错题讲解系统的设计与实现》（濮存来 · 难度"难" · 自拟课题）
 > **硬约束（不可改）**：Python + FastAPI · Vue3 · SQLite · 免费大模型 API · 无需 GPU
-> **版本**：**内容 v3.9** ｜ 2026-11-13 ｜ **状态：唯一权威版（Single Source of Truth）**
+> **版本**：**内容 v3.10** ｜ 2026-11-13 ｜ **状态：唯一权威版（Single Source of Truth）**
+> **v3.10 = "系统在说话"专项修正的契约回写（2026-11-13，A-2/A-3/B-1/B-2/B-3 交付审查通过）**：§8.2 的 guard 事件拆成**三个独立判据**（C-33：`schema` 新增 `retry`，`evidence_binding` 新增 **`partial`**，新增 `accepted`/`total`，`retries` 可空）；`done.latency_ms` 可空且**禁止用 0 顶替**（C-34）；能力走 CLI（C-35）。**实现揭露的事实**：`retries` 曾是**恒为 0 的假字段**，且 diagnose 节点一直在偶发重试——**我们从 P1.6 起从未看见过这个率**。
 > **v3.9 = 三条口径变更（2026-11-13 已确认）**：① **`G2` 从「公网可演示」改为「本地一条命令 + 录屏 ≤90s」**（项目长期本地部署本地测试，业务层为次要地位）；② **`P2.6` 部署降为可选，不阻塞任何 Gate**；③ **`POST/GET /api/v1/eval/runs*` 从 REST 契约降为 CLI-only（C-32）**。落点：§8.1、§17.1 W4、§1.1 对齐表、§4.14 触发条件；TODO 侧同步 §0.3 / §3.2 / §3.4 / §7.2 / §10.1。
 > **v3.1 = 采纳外部评审后的修订版**：关闭 5 处硬伤 + 12 处内部不一致 + 4 处设计风险（明细见下方「v3.1 修订记录」）。**v3.0 的六条不变量与证据绑定机制不变。**
 > **v3.2 = P1.1 沙箱落地后的设计回写**：把实现中涌现的**值域政策 / 判定分类学 / 常驻 worker / 超时口径**升格为设计条款（见「v3.2 修订记录」）。
@@ -663,7 +664,7 @@ flowchart TB
      event: stage   {"stage":"verify","check":"not_equal","evidence_id":"ev_2"}
      event: claim   {"field":"error_type","value":"程序性错误","evidence":["ev_2","ev_5"]}
      event: token   {"text":"第 1 步：先分部积分…"}
-     event: guard   {"schema":"pass","evidence_binding":"pass","retries":1}
+     event: guard   {"schema":"pass","evidence_binding":"partial","retries":0,"accepted":1,"total":2}
      event: done    {"terminal":"diagnosed","latency_ms":9420,"tokens":5120,"run_id":"r-…"}
 ④ 服务端在 done 之前完成：
      守卫：schema → 枚举 → **证据绑定** → 置信度阈值
@@ -2622,14 +2623,20 @@ data: {"field":"error_type","value":"程序性错误","evidence_ids":["ev_2"]}
 event: token
 data: {"text":"第 1 步：先求不定积分 ∫x·e^x dx"}
 
-// 5. 守卫裁决
+// 5. 守卫裁决（C-33：**三个判据各自独立**，不允许一个布尔冲当）
 event: guard
-data: {"schema":"pass","evidence_binding":"pass","retries":1}
+data: {"schema":"pass","evidence_binding":"partial","retries":0,"accepted":1,"total":2}
+//   schema          ∈ {pass, retry, fail}；"retry" = 曾回喂重试过
+//   evidence_binding∈ {pass, partial, fail_after_retry, skipped}
+//   retries         = 真实重试次数；**拿不到就发 null，不允许用 0 顶替**
+//   accepted/total  = 断言维度的分子分母；**partial 必须可见**
 
 // 6. 结束（唯一）
 event: done
 data: {"terminal":"diagnosed","reason_code":null,"run_id":"r-8f2c","latency_ms":9420,
        "tokens":{"in":3120,"out":2000}}
+//   latency_ms ∈ int | null（C-34）：**拿不到就 null，不允许编 0**（否则界面上的
+//   "· 0.0s" 会让人误判“秒失败 = 参数错”）
 ```
 
 **契约要求**
