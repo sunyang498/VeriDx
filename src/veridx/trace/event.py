@@ -23,6 +23,10 @@ class NodeStatus(StrEnum):
 
 class NodeName(StrEnum):
     PARSE = "parse"
+    #: 隔离提取器（方案 §6.1）：自由文本 → 结构化字段
+    EXTRACT = "extract"
+    #: 归一化（方案 §6.1）：两侧各一条
+    NORMALIZE = "normalize"
     BLIND_SOLVE = "blind_solve"
     CHECK_NUMERIC = "check_numeric"
     STEP_DIFF = "step_diff"
@@ -67,6 +71,17 @@ class ReasonCode(StrEnum):
     STUDENT_ANSWER_CORRECT = "student_answer_correct"
     #: C-18（P1.6 新增，待登记）：盲解三者不一致（模型、学生、答案键互不相同）
     VERIFIER_DISAGREES = "verifier_disagrees"
+    #: C-40（方案 §6.3）：**设计好的终态**，不是未预见缺陷 —— 必须可统计。
+    #: 隔离提取器 schema/重试耗尽（fail closed，不许拿原始文本硬上）
+    EXTRACTION_FAILED = "extraction_failed"
+    #: 出处核验失败：提取器说了"这段是题干"，但它给的字符区间里没有这些字
+    PROVENANCE_MISMATCH = "provenance_mismatch"
+    #: 双路径归一化结论不一致（确定性解析器 × 模型）
+    NORMALIZATION_CONFLICT = "normalization_conflict"
+    #: 只有模型产出、无法交叉验证，而这一步需要判等
+    NORMALIZATION_UNVERIFIED = "normalization_unverified"
+    #: 判据字段来自提取器 —— 属于**代码 bug**，正常不该出现（出现了必须能被看见）
+    JUDGED_INPUT_FROM_UNTRUSTED = "judged_input_from_untrusted"
 
 
 @dataclass(frozen=True)

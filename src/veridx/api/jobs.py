@@ -102,6 +102,7 @@ class JobManager:
             runner = Runner(
                 primary=primary,
                 second=second,
+                extract=_extract_provider(),
                 conn=conn,
                 limits=RunLimits(),
                 tracer=tracer,
@@ -134,6 +135,18 @@ def _default_providers() -> tuple[Any, Any | None]:
     primary = llm_factory.build_provider(role="primary")
     second = llm_factory.build_provider(role="second") if _second_available() else None
     return primary, second
+
+
+def _extract_provider() -> Any | None:
+    """隔离提取器（方案 §4）：**没有就返回 None**，由 runner fail closed。
+
+    注意它**不能**退回主模型：那会把"无特权的小模型"变成"有特权的大模型"，
+    隔离就白做了（方案 §1 铁律）。
+    """
+    try:
+        return llm_factory.build_provider(role="extract")
+    except llm_factory.ProviderConfigError:
+        return None
 
 
 def _second_available() -> bool:

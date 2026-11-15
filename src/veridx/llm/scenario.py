@@ -29,6 +29,25 @@ __all__ = ["ScenarioMockProvider"]
 _EVIDENCE_LINE = re.compile(r"-\s+(ev_\d+)\s+kind=(\w+)\s+status=(\w+)")
 _STEM_BLOCK = re.compile(r"<<DATA id=\w+ field=stem>>\s*\n(.+?)\n<</DATA", re.DOTALL)
 _LEGACY_STEM = re.compile(r"【题干】\s*\n(.+)")
+_RAW_BLOCK = re.compile(r"<<DATA id=\w+ field=raw_input>>\s*\n(.+?)\n<</DATA", re.DOTALL)
+_ANY_BLOCK = re.compile(r"<<DATA id=\w+ field=\w+>>\s*\n(.+?)\n<</DATA", re.DOTALL)
+
+#: 离线演示用的中文数字表（只为让 mock 能跑通"四分之三"，不是识别器）
+_CN_DIGITS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+_CN_FRACTION = re.compile(r"([零一二两三四五六七八九十]+)分之([零一二两三四五六七八九十]+)")
 
 
 @dataclass
@@ -52,8 +71,15 @@ class ScenarioMockProvider:
         temperature: float | None = None,
         seed: int | None = None,
         response_format: str | None = None,
+        max_tokens: int | None = None,
     ) -> ChatResult:
-        self.calls.append({"messages": [dict(m) for m in messages], "response_format": response_format})
+        self.calls.append(
+            {
+                "messages": [dict(m) for m in messages],
+                "response_format": response_format,
+                "max_tokens": max_tokens,
+            }
+        )
         prompt = "\n".join(str(message.get("content", "")) for message in messages)
         text = self._reply(prompt)
         usage = Usage(input_tokens=max(len(prompt) // 4, 1), output_tokens=max(len(text) // 4, 1))
@@ -65,6 +91,10 @@ class ScenarioMockProvider:
         )
 
     def _reply(self, prompt: str) -> str:
+        if "题目结构提取器" in prompt:
+            return _extract_reply(prompt)
+        if "数学表达式转写器" in prompt:
+            return _normalize_reply(prompt)
         if "独立求解" in prompt:
             return json.dumps(
                 {
@@ -140,6 +170,71 @@ class ScenarioMockProvider:
 
 _STEM_BLOCK = re.compile(r"<<DATA id=\w+ field=stem>>\s*\n(.+?)\n<</DATA", re.DOTALL)
 _LEGACY_STEM = re.compile(r"【题干】\s*\n(.+)")
+
+
+def _cn_value(text: str) -> int | None:
+    if not text:
+        return None
+    if text == "十":
+        return 10
+    if "十" in text:  # 十一 / 二十 / 二十三
+        head, _, tail = text.partition("十")
+        tens = _CN_DIGITS.get(head, 1) if head else 1
+        ones = _CN_DIGITS.get(tail, 0) if tail else 0
+        return tens * 10 + ones
+    if len(text) == 1:
+        return _CN_DIGITS.get(text)
+    return None
+
+
+def _span_of(raw: str, chunk: str) -> tuple[int, int]:
+    """`chunk` 在 `raw` 里的位置；返回**去掉首尾空白后**的区间（与 `verify_span` 的空白归一一致）。"""
+    start = raw.find(chunk) if chunk else 0
+    if start < 0:
+        start = 0
+    trimmed = chunk.strip() if chunk else ""
+    offset = chunk.find(trimmed) if trimmed else 0
+    return (start + offset, start + offset + len(trimmed))
+
+
+def _extract_reply(prompt: str) -> str:
+    """脚本提取器：按"学生答案："把原文切成题干与作答，并给出**真实偏移**。"""
+    match = _RAW_BLOCK.search(prompt)
+    raw = match.group(1) if match else ""
+    stem, student = raw, None
+    for marker in ("学生答案：", "学生答：", "学生答案:", "答案：", "Student answer:"):
+        index = raw.find(marker)
+        if index >= 0:
+            stem = raw[:index]
+            student = raw[index + len(marker) :]
+            break
+    stem_span = _span_of(raw, stem)
+    student_span = _span_of(raw, student) if student is not None else None
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in raw)
+    return json.dumps(
+        {
+            "stem": stem.strip(),
+            "stem_span": list(stem_span),
+            "student_answer": student.strip() if student is not None and student.strip() else None,
+            "student_answer_span": list(student_span) if student_span else None,
+            "detected_lang": "zh" if has_cjk else "en",
+            "layout_hint": "with_answer_line" if student is not None else "single",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _normalize_reply(prompt: str) -> str:
+    """脚本归一化器：只处理"X分之Y"这一种中文分数，其它一律 `needs_human`。"""
+    match = _RAW_BLOCK.search(prompt) or _ANY_BLOCK.search(prompt)
+    raw = (match.group(1) if match else "").strip()
+    fraction = _CN_FRACTION.search(raw)
+    if fraction:
+        denominator = _cn_value(fraction.group(1))
+        numerator = _cn_value(fraction.group(2))
+        if denominator and numerator is not None:
+            return json.dumps({"expr": f"(({numerator})/({denominator}))", "needs_human": False})
+    return json.dumps({"expr": "0", "needs_human": True})
 
 
 def _extract_expected(prompt: str) -> str:

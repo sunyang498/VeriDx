@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--student", default=None, help="覆盖学生答案（默认取样本/最近一次作答）")
     run.add_argument("--out", default=None, help="把结果写成 JSON")
     run.add_argument("--no-explain", action="store_true", help="跳过讲解节点（省一次调用）")
+    run.add_argument("--raw", default=None, help="freetext 模式：直接贴一段不可信原文")
+    run.add_argument("--answer-key", default=None, help="freetext 模式下的答案键（可信来源，可缺）")
 
     replay = sub.add_parser("replay", help="打印某次 run 的 trace 时间线")
     replay.add_argument("run_id", help="run_id（`veridx run` 会打印）")
@@ -70,6 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
     eval_mode.add_argument("--real", action="store_true", help="强制真模型")
     eval_parser.add_argument("--no-explain", action="store_true", help="跳过讲解节点（省一次调用）")
     eval_parser.add_argument("--no-reuse", action="store_true", help="不复用已有结果，强制重跑")
+
+    dataset = sub.add_parser("dataset", help="数据集产物（评测前的 preflight）")
+    dataset_sub = dataset.add_subparsers(dest="dataset_command")
+    dataset_check = dataset_sub.add_parser("check", help="跑 preflight：结构 / 可解析率 / TD4 / 分片 / 重复")
+    dataset_check.add_argument("--suite", required=True, help="数据集（JSONL）")
+    dataset_check.add_argument(
+        "--out", default=None, help="preflight.json 路径（默认 eval/reports/<名称>.preflight.json）"
+    )
     return parser
 
 
@@ -153,6 +163,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             student=args.student,
             out=args.out,
             explain=not args.no_explain,
+            raw=args.raw,
+            answer_key=args.answer_key,
         )
     if args.command == "replay":
         from veridx import cli_ops
@@ -173,6 +185,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             explain=not args.no_explain,
             reuse=not args.no_reuse,
         )
+    if args.command == "dataset" and args.dataset_command == "check":
+        from veridx import cli_eval
+
+        return cli_eval.cmd_dataset_check(suite=args.suite, out=args.out)
     build_parser().print_help()
     return 0
 

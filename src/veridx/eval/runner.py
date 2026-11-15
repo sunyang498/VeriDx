@@ -178,14 +178,19 @@ def _steps_usable(result: Any) -> tuple[int, bool]:
     return len(steps), usable
 
 
-def _build_providers(mode: str | None) -> tuple[Any, Any | None]:
+def _build_providers(mode: str | None) -> tuple[Any, Any | None, Any | None]:
     primary = llm_factory.build_provider(role="primary", mode=mode)
     second: Any | None = None
     try:
         second = llm_factory.build_provider(role="second", mode=mode)
     except llm_factory.ProviderConfigError:
         second = None
-    return primary, second
+    extract: Any | None = None
+    try:
+        extract = llm_factory.build_provider(role="extract", mode=mode)
+    except llm_factory.ProviderConfigError:
+        extract = None
+    return primary, second, extract
 
 
 async def _run_one(
@@ -209,11 +214,12 @@ async def _run_one(
             course=case.course,
         ),
     )
-    primary, second = _build_providers(mode)
+    primary, second, extract = _build_providers(mode)
     run_id = new_id("r")
     runner = Runner(
         primary=primary,
         second=second,
+        extract=extract,
         conn=conn,
         limits=RunLimits(explain=explain),
         tracer=TraceRecorder(conn=conn, run_id=run_id),

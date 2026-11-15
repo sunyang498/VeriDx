@@ -38,9 +38,11 @@ ESTIMATED_LATENCY_MS = 9000  # 202 响应里的 estimated_ms，实测后按 P95 
 
 # ---- 预算与调用上限（NFR-1 / NFR-2 / §2.3.2 / §5.3.3）----
 #: 单题 LLM 调用上限；本地 sympy 计算（check_numeric / step_diff）不计次数、不计 token
-MAX_LLM_CALLS = 7
-#: §2.3.2 的节点预算；四者之和必须等于 MAX_LLM_CALLS（由 tests/test_config.py 守护）
-NODE_MAX_CALLS: dict[str, int] = {"parse": 1, "blind_solve": 2, "diagnose": 3, "explain": 1}
+#: 方案 §7：7 → 8（+1 次隔离提取；`structured` 模式**不加**）
+MAX_LLM_CALLS = 8
+#: §2.3.2 的节点预算；五者之和必须等于 MAX_LLM_CALLS（由 tests/test_config.py 守护）
+#: `extract` 只在 `input_mode=freetext` 时用掉（方案 §7 的成本快速路）
+NODE_MAX_CALLS: dict[str, int] = {"parse": 1, "extract": 1, "blind_solve": 2, "diagnose": 3, "explain": 1}
 LOCAL_TOOL_MAX_CALLS = 3
 #: 单次调用的上下文窗口（NFR-2 的第一个维度）
 PER_CALL_CTX_TOKENS = 8000
@@ -53,6 +55,13 @@ MAX_COMPLETION_TOKENS = 2048
 CHARS_PER_TOKEN = 3
 #: prompt 模板本身的固定开销（角色声明 + 输出格式说明）
 PROMPT_OVERHEAD_TOKENS = 400
+#: 隔离提取器（方案 §7）：单次输出上界。提取只产 span，不需要长文本。
+EXTRACT_MAX_TOKENS = 800
+#: 模型归一化器（方案 §7）：只产一个表达式，200 足够；超了就是它在"解释"
+NORMALIZE_MAX_TOKENS = 200
+#: 提取器的重试次数：比主流程的 ≤2 更少（方案 §4.1 第 5 条）。
+#: 提取失败通常是输入问题（不是"模型这次不走运"），重试收益低、成本线性涨。
+EXTRACT_MAX_RETRIES = 1
 WALL_CLOCK_SECONDS = 180
 #: T1 用例口径：注入 300s 挂死题时，整批仍须在该上限内出报告
 BATCH_WALL_CLOCK_SECONDS = 200
@@ -178,6 +187,17 @@ SECOND_TEMPERATURE = float(
     os.getenv("SECOND_TEMPERATURE") or os.getenv("TEMPERATURE_KIMI") or DEFAULT_TEMPERATURE
 )
 
+#: 隔离提取器 / 模型归一化器（方案 §4 / §3.1）：**第三组凭据**，与主/第二模型并列。
+#: 它承担"把不可信自由文本变成结构化数据"，所以**没有任何工具**、单轮、temperature=0。
+EXTRACT_MODEL = (os.getenv("EXTRACT_MODEL") or os.getenv("MODEL_QLLM") or "").strip()
+EXTRACT_BASE_URL = (os.getenv("EXTRACT_BASE_URL") or os.getenv("BASE_QLLM_URL") or "").strip()
+EXTRACT_API_KEY = (os.getenv("EXTRACT_API_KEY") or os.getenv("API_QLLM_KEY") or "").strip()
+EXTRACT_MODE = os.getenv("LLM_MODE_QLLM", "auto").strip()
+EXTRACT_TEMPERATURE = 0.0  # 可复现优先：提取器与归一化器一律 0 度
+#: 千问 3.x 默认带 thinking：实测同一请求 12.4s / 1177 tokens vs 关掉后 0.8s / 22 tokens。
+#: `extra_body` 形式无效（实测仍走 thinking），必须作为**顶层字段**发出去。
+EXTRACT_EXTRA_PAYLOAD: dict[str, object] = {"enable_thinking": False}
+
 #: fail-closed：公网部署必须显式要求真实模型；`auto` 静默退化 mock 会让"演示完全正常"
 #: 但一句模型都没调（P1.3 审查 🟡F1）
 REQUIRE_REAL_LLM = os.getenv("VERIDX_REQUIRE_REAL_LLM", "").strip().lower() in {"1", "true", "yes"}
@@ -192,6 +212,11 @@ def has_key(key: str) -> bool:
 def has_second_model() -> bool:
     """第二模型是否可用：分支 B 闸 2 与 judge 都依赖它（设计文档 §3.1.5 / §10.5）。"""
     return bool(SECOND_MODEL) and has_key(SECOND_API_KEY)
+
+
+def has_extract_model() -> bool:
+    """隔离提取器是否可用（方案 §4）。不可用时 `freetext` 模式必须 fail closed。"""
+    return bool(EXTRACT_MODEL) and has_key(EXTRACT_API_KEY)
 
 
 @dataclass(frozen=True)

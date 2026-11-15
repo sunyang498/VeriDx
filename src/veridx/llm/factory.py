@@ -29,6 +29,14 @@ def _settings_for(role: str) -> tuple[str, str, str, str]:
             config.SECOND_BASE_URL,
             config.SECOND_API_KEY,
         )
+    if role == "extract":
+        # 隔离提取器 / 模型归一化器：**第三组凭据**（方案 §4.1）
+        return (
+            config.EXTRACT_MODE or config.LLM_MODE,
+            config.EXTRACT_MODEL,
+            config.EXTRACT_BASE_URL,
+            config.EXTRACT_API_KEY,
+        )
     return config.LLM_MODE, config.MODEL, config.BASE_URL, config.API_KEY
 
 
@@ -79,6 +87,18 @@ def build_provider(
         # `mock` 模式下用**按提示词分派**的 provider：整条流水线能真跑通（离线演示/CI）
         return ScenarioMockProvider(
             name=f"scenario-mock:{role}", model=f"mock-{role}", blind_answer=blind_answer
+        )
+
+    if role == "extract":
+        # 提取器：temperature=0 + `enable_thinking: false`（实测 12.4s→0.8s）+ 无工具
+        return OpenAICompatProvider(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            name=f"openai_compat:{role}",
+            temperature=config.EXTRACT_TEMPERATURE,
+            transport=transport,
+            extra_payload=config.EXTRACT_EXTRA_PAYLOAD,
         )
 
     return OpenAICompatProvider(

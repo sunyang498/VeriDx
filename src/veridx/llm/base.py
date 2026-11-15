@@ -68,6 +68,7 @@ class LLMProvider(Protocol):
         temperature: float = 0.2,
         seed: int | None = None,
         response_format: str | None = None,
+        max_tokens: int | None = None,
     ) -> ChatResult: ...
 
 

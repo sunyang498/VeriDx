@@ -34,6 +34,7 @@ class OpenAICompatProvider:
         name: str | None = None,
         temperature: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("API key 为空：拒绝构造 provider（避免把空 key 发出去）")
@@ -43,6 +44,9 @@ class OpenAICompatProvider:
         self._api_key = api_key
         self._temperature = config.DEFAULT_TEMPERATURE if temperature is None else temperature
         self._transport = transport
+        #: 提供方特有的**顶层**请求字段（如千问的 `enable_thinking: false`）。
+        #: 实测把它放进 `extra_body` 无效，必须作为顶层字段随 payload 一起发。
+        self._extra_payload = dict(extra_payload or {})
         #: 记账（评测成本口径）
         self.total_usage = Usage()
         self.last_attempts = 0
@@ -68,6 +72,7 @@ class OpenAICompatProvider:
         temperature: float | None = None,
         seed: int | None = None,
         response_format: str | None = None,
+        max_tokens: int | None = None,
     ) -> ChatResult:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -78,6 +83,11 @@ class OpenAICompatProvider:
             payload["seed"] = seed
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
+        if max_tokens is not None:
+            # 提取器/归一化器的成本上界（方案 §7）。不传 = 沿用提供方默认。
+            payload["max_tokens"] = int(max_tokens)
+        # 提供方扩展字段最后合并：它们不进 `describe()`，避免把实现细节当契约暴露
+        payload.update(self._extra_payload)
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",

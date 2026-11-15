@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -40,6 +40,8 @@ from pydantic import BaseModel, Field
 from veridx import config
 from veridx.api.schemas import Arm, EvidenceBinding, Terminal
 from veridx.clock import new_id
+from veridx.extract.extractor import run_extract
+from veridx.extract.schema import FieldSource
 from veridx.flow.blind_solve import BlindSolveOutcome, Branch, Suspect, blind_solve
 from veridx.flow.explain import Explanation, explain
 from veridx.guard.claim import Claim, ClaimField, Evidence
@@ -57,6 +59,7 @@ from veridx.guard.evidence import (
 from veridx.guard.injection import scan_untrusted
 from veridx.guard.structured import Budget, StructuredOutputError, call_structured
 from veridx.llm.base import LLMProvider
+from veridx.normalize.gate import CONFLICT, normalize_side
 from veridx.prompts import diagnose as diagnose_prompt
 from veridx.sandbox import Verdict, compare, evaluate, static_check
 from veridx.sandbox.verdict import Reason
@@ -105,6 +108,13 @@ class RunSpec:
     symbols: frozenset[str] | None = None
     arm: str = Arm.D.value
     item_id: str | None = None
+    #: C-38（方案 §2.1）：`structured` 直接进流程；`freetext` 先过隔离提取器
+    input_mode: str = "structured"
+    raw_input: str | None = None
+    #: 出处（`FieldSource`）：判据字段**永远**不能是 `extracted`
+    stem_source: str = "user_form"
+    student_answer_source: str = "user_form"
+    answer_key_source: str = "user_form"
 
 
 @dataclass
@@ -164,12 +174,14 @@ class Runner:
         *,
         primary: LLMProvider,
         second: LLMProvider | None = None,
+        extract: LLMProvider | None = None,
         conn: Any | None = None,
         limits: RunLimits | None = None,
         tracer: TraceRecorder | None = None,
         run_id: str | None = None,
         budget: Budget | None = None,
         clock: Callable[[], float] = time.monotonic,
+        normalize: bool = True,
     ) -> None:
         self.run_id = run_id or new_id("r")
         self.limits = limits or RunLimits()
@@ -177,6 +189,11 @@ class Runner:
         self.clock = clock
         self.primary = primary
         self.second = second
+        #: 隔离提取器 / 模型归一化器（方案 §4）：**无工具、单轮、温度 0**，与主模型是两套凭据。
+        #: `None` = 没有隔离模型可用 → `freetext` 模式 fail closed，归一化只能走确定性解析器。
+        self.extract = extract
+        #: 关掉归一化只用于对照实验与回放（默认开）
+        self.normalize_enabled = normalize
         self.budget = budget or Budget(remaining_tokens=self.limits.max_tokens)
         self.tracer = tracer or TraceRecorder(conn=conn, run_id=self.run_id)
         self._started = clock()
@@ -190,6 +207,10 @@ class Runner:
         self._escalation_kind: EscalationKind | None = None
         #: 诊断阶段的真实重试次数（`None` = 还没走到 diagnose，别用 0 假装"没重试过"）
         self._schema_retries: int | None = None
+        #: 方案 §2.1：无标准答案也**合法**（纯盲解模式），不能报成"输入坏了"
+        self._key_mode: str = "present"
+        #: 归一化两侧的结论（落 trace、进报告头；`None` = 该侧没有参与归一化）
+        self._normalized: dict[str, Any] = {}
         self.notes: list[str] = []
         self.ctx = ToolContext(run_id=self.run_id, conn=conn)
 
@@ -202,7 +223,7 @@ class Runner:
         claims: list[ClaimWithSeq] = []
         diagnosis: dict[str, Any] | None = None
         try:
-            await self._node_parse(spec)
+            spec = await self._node_parse(spec)
             blind = await self._node_blind(spec)
             self._node_tools(spec, blind)
             block = self._reserve_claim_block()
@@ -311,8 +332,96 @@ class Runner:
         self._tokens_out += max(usage_out, 0)
         self.budget.spend(max(usage_total, 0))
 
+    # ---- 节点 0：隔离提取（只有 freetext 才走）----------------------------
+    async def _node_extract(self, spec: RunSpec) -> RunSpec:
+        """自由文本 → 结构化字段（方案 §1 ~ §4）。
+
+        三条顺序不能换：**静态前置（不调模型）→ 隔离提取 → 出处核验**。
+        任何一步失败都 fail closed，绝不"用原始文本硬上"。
+        """
+        raw = (spec.raw_input or "").strip()
+        if not raw:
+            self.tracer.event(
+                NodeName.EXTRACT.value,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.UNPARSABLE_STEM.value,
+                detail={"reason": "empty_raw_input"},
+                item_id=spec.item_id,
+            )
+            self._finish(Terminal.NEEDS_CLARIFICATION, ReasonCode.UNPARSABLE_STEM.value)
+        # ① 静态前置：长度与字符集，一个请求都不发就知道它不可能是题
+        if len(raw) > config.STEM_MAX_CHARS * 2:
+            self.tracer.event(
+                NodeName.EXTRACT.value,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.EXTRACTION_FAILED.value,
+                detail={"reason": "raw_too_long", "raw_chars": len(raw)},
+                item_id=spec.item_id,
+            )
+            self._finish(Terminal.NEEDS_CLARIFICATION, ReasonCode.EXTRACTION_FAILED.value)
+        if not any(ch.isprintable() for ch in raw):
+            self._finish(Terminal.NEEDS_CLARIFICATION, ReasonCode.EXTRACTION_FAILED.value)
+
+        # ② 隔离提取：没有隔离模型可用 → fail closed（不许退回主模型，那是特权混淆）
+        self._check_budget(NodeName.EXTRACT.value)
+        if self.extract is None:
+            self.tracer.event(
+                NodeName.EXTRACT.value,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.EXTRACTION_FAILED.value,
+                detail={"reason": "no_extract_provider"},
+                item_id=spec.item_id,
+            )
+            self._finish(Terminal.NEEDS_CLARIFICATION, ReasonCode.EXTRACTION_FAILED.value)
+        outcome = await run_extract(self.extract, raw, tracer=self.tracer, budget=self.budget)
+        if outcome.attempts:
+            self._spend(
+                outcome.tokens_in + outcome.tokens_out,
+                usage_in=outcome.tokens_in,
+                usage_out=outcome.tokens_out,
+            )
+        if not outcome.ok or outcome.draft is None:
+            code = outcome.reason_code or ReasonCode.EXTRACTION_FAILED.value
+            terminal = (
+                Terminal.NEEDS_CLARIFICATION
+                if code in {ReasonCode.EXTRACTION_FAILED.value, ReasonCode.PROVENANCE_MISMATCH.value}
+                else Terminal.ESCALATED
+            )
+            self.notes.append(f"extract_failed:{code}")
+            self._finish(terminal, code)
+
+        # ③ 判据装配：**数据字段**可以来自提取器，**判据字段**永远不行（方案 §1 铁律 1）
+        draft = outcome.draft
+        spec = replace(
+            spec,
+            stem=draft.stem,
+            stem_source=FieldSource.EXTRACTED.value,
+            student_answer=draft.student_answer or "",
+            student_answer_source=(
+                FieldSource.EXTRACTED.value if draft.student_answer else FieldSource.DEFAULT.value
+            ),
+        )
+        self.tracer.event(
+            NodeName.EXTRACT.value,
+            status=NodeStatus.OK,
+            detail={
+                "stage": "assemble",
+                "stem_source": spec.stem_source,
+                "student_answer_source": spec.student_answer_source,
+                "answer_key_source": spec.answer_key_source,
+                "detected_lang": draft.detected_lang,
+                "layout_hint": draft.layout_hint,
+                "stem_span": list(draft.stem_span),
+            },
+            item_id=spec.item_id,
+        )
+        return spec
+
     # ---- 节点 1：parse ---------------------------------------------------
-    async def _node_parse(self, spec: RunSpec) -> None:
+    async def _node_parse(self, spec: RunSpec) -> RunSpec:
+        if spec.input_mode == "freetext":
+            spec = await self._node_extract(spec)
+
         stem = spec.stem.strip()
         answer = spec.student_answer.strip()
         if not stem:
@@ -323,26 +432,93 @@ class Runner:
             # 与 API 入口闸门同一口径（§8.5），控制流自己也守一道
             self._finish(Terminal.NEEDS_CLARIFICATION, ReasonCode.UNPARSABLE_ANSWER.value)
         if not spec.answer_key.strip():
-            raise self._reject(NodeName.PARSE, ReasonCode.UNPARSABLE_STEM, "标准答案为空")
-        key_static = static_check(spec.answer_key)
-        if key_static is not None and key_static[1].startswith(Reason.NOT_REPRESENTABLE.value):
-            # 必6（X4）：**答案键本身**超出可表示范围 → 能力边界（映射 escalated），
-            # 不能让它退化成"判不了/格式错"：那会把容量问题说成输入问题。
-            # 静态判（0.2ms）→ 一个请求都不发，比等模型答完再说便宜得多。
-            self.tracer.event(
-                NodeName.PARSE.value,
-                status=NodeStatus.SKIPPED,
-                reason_code=ReasonCode.ANSWER_UNREPRESENTABLE.value,
-                detail={"reason": key_static[1], "answer_key_len": len(spec.answer_key)},
-                item_id=spec.item_id,
-            )
-            self._finish(Terminal.ESCALATED, ReasonCode.ANSWER_UNREPRESENTABLE.value)
+            # 方案 §2.1：无标准答案**合法**（纯盲解模式）。这里不能报"输入坏了"。
+            # 只有结构化模式（表单/数据集）才把缺答案键当输入问题。
+            if spec.input_mode == "freetext":
+                self._key_mode = "absent"
+                self.notes.append("key_mode=absent")
+            else:
+                raise self._reject(NodeName.PARSE, ReasonCode.UNPARSABLE_STEM, "标准答案为空")
+
+        spec = await self._node_normalize(spec)
+
+        if spec.answer_key.strip():
+            key_static = static_check(spec.answer_key)
+            if key_static is not None and key_static[1].startswith(Reason.NOT_REPRESENTABLE.value):
+                # 必6（X4）：**答案键本身**超出可表示范围 → 能力边界（映射 escalated），
+                # 不能让它退化成"判不了/格式错"：那会把容量问题说成输入问题。
+                # 静态判（0.2ms）→ 一个请求都不发，比等模型答完再说便宜得多。
+                self.tracer.event(
+                    NodeName.PARSE.value,
+                    status=NodeStatus.SKIPPED,
+                    reason_code=ReasonCode.ANSWER_UNREPRESENTABLE.value,
+                    detail={"reason": key_static[1], "answer_key_len": len(spec.answer_key)},
+                    item_id=spec.item_id,
+                )
+                self._finish(Terminal.ESCALATED, ReasonCode.ANSWER_UNREPRESENTABLE.value)
         self.tracer.event(
             NodeName.PARSE.value,
             status=NodeStatus.OK,
-            detail={"stem_len": len(stem), "answer_len": len(answer)},
+            detail={
+                "stem_len": len(stem),
+                "answer_len": len(answer),
+                "input_mode": spec.input_mode,
+                "key_mode": self._key_mode,
+                "sources": {
+                    "stem": spec.stem_source,
+                    "student_answer": spec.student_answer_source,
+                    "answer_key": spec.answer_key_source,
+                },
+                "normalized": {
+                    side: {"verdict": item.verdict, "normalizer": item.normalizer}
+                    for side, item in self._normalized.items()
+                },
+            },
             item_id=spec.item_id,
         )
+        return spec
+
+    async def _node_normalize(self, spec: RunSpec) -> RunSpec:
+        """两侧**同时**归一化（方案 §3.4），并用双闸决定能不能拿去判等。
+
+        任一侧 `conflict` → `escalated/normalization_conflict`；
+        任一侧不可用 → `escalated/normalization_unverified`（宁可不答，见 §6.1.5）。
+        纯 ASCII 输入两侧都是 `unchanged` → 一次模型都不调，行为与改造前完全一致。
+        """
+        if not self.normalize_enabled:
+            return spec
+        sides = (
+            ("answer_key", spec.answer_key, "answer_key"),
+            ("student_answer", spec.student_answer, "student_answer"),
+        )
+        updates: dict[str, str] = {}
+        for label, value, attr in sides:
+            if not value or not value.strip():
+                continue
+            outcome = await normalize_side(
+                value,
+                side=attr,  # type: ignore[arg-type]
+                provider=self.extract,
+                tracer=self.tracer,
+                budget=self.budget,
+            )
+            self._normalized[label] = outcome
+            if outcome.tokens_in or outcome.tokens_out:
+                self._spend(
+                    outcome.tokens_in + outcome.tokens_out,
+                    usage_in=outcome.tokens_in,
+                    usage_out=outcome.tokens_out,
+                )
+            if outcome.verdict == CONFLICT:
+                self.notes.append(f"normalization_conflict:{label}")
+                self._finish(Terminal.ESCALATED, ReasonCode.NORMALIZATION_CONFLICT.value)
+            if not outcome.usable:
+                self.notes.append(f"normalization_unverified:{label}:{','.join(outcome.notes[:2])}")
+                self._finish(Terminal.ESCALATED, ReasonCode.NORMALIZATION_UNVERIFIED.value)
+            # 用归一化后的值继续（**两侧都换**，否则误差会直接变成"判错"）
+            if outcome.normalized != value:
+                updates[attr] = outcome.normalized
+        return replace(spec, **updates) if updates else spec
 
     def _reject(self, node: str, code: ReasonCode, message: str) -> _Done:
         self.tracer.event(
@@ -376,6 +552,23 @@ class Runner:
             self._finish(Terminal.UNCERTAIN, ReasonCode.SKIPPED_BUDGET.value)
         self._spend(outcome.usage_total, usage_in=outcome.usage_in, usage_out=outcome.usage_out)
         self._blind = outcome
+
+        if self._key_mode == "absent":
+            # 方案 §2.1：没有标准答案时**不假装能判对错**。盲解答案留在 outcome 里
+            # （报告可见），但终态是 `escalated` —— 判据缺失不是模型的错，也不是输入坏了。
+            self.tracer.event(
+                NodeName.BLIND_SOLVE.value,
+                status=NodeStatus.SKIPPED,
+                reason_code=ReasonCode.INSUFFICIENT_EVIDENCE.value,
+                detail={
+                    "reason": "key_mode_absent",
+                    "model_answer_present": bool(outcome.model_answer),
+                    "note": "无标准答案 → 纯盲解模式下不给出对错判定，转人工",
+                },
+                item_id=spec.item_id,
+            )
+            self._escalation_kind = EscalationKind.CAPABILITY
+            self._finish(Terminal.ESCALATED, ReasonCode.INSUFFICIENT_EVIDENCE.value)
 
         if outcome.branch is Branch.S_STUDENT_CORRECT:
             # 学生本来就对：不许"找出一个错因"（F6 误判率的守门人）

@@ -20,7 +20,7 @@ from veridx.prompts import blind_solve as blind_prompt
 from veridx.prompts import diagnose as diagnose_prompt
 from veridx.prompts import explain as explain_prompt
 
-__all__ = ["cmd_eval"]
+__all__ = ["cmd_dataset_check", "cmd_eval"]
 
 #: 指标口径版本：改了汇总口径就 +1，否则跨版本的数字不可比
 METRICS_VERSION = "eval-v1"
@@ -91,6 +91,50 @@ def _reuse_items(out_path: Path, header: dict[str, Any]) -> list[eval_runner.Ite
         except (KeyError, TypeError, ValueError):
             return []  # 旧报告格式不认识 → 整体不复用，宁可重跑
     return items
+
+
+def cmd_dataset_check(*, suite: str, out: str | None) -> int:
+    """C-1~C-6：跑批**之前**把坏数据找出来。退出码：能跑 = 0；有阻断项 = 1。"""
+    from veridx.eval import preflight as preflight_mod
+
+    suite_path = Path(suite)
+    if not suite_path.is_absolute():
+        suite_path = config.PROJECT_ROOT / suite_path
+    if not suite_path.exists():
+        print(f"数据集不存在：{suite_path}")
+        return 2
+
+    report = preflight_mod.run_preflight(suite_path)
+    out_path = Path(out) if out else (config.EVAL_REPORTS_DIR / f"{suite_path.stem}.preflight.json")
+    if not out_path.is_absolute():
+        out_path = config.PROJECT_ROOT / out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    parse = report.parse
+    print(f"数据集：{suite_path}（{report.rows} 行有效，hash {report.dataset_hash}）")
+    print(
+        "可解析性："
+        f"parse_ok={parse['parse_ok']}  parser_normalized={parse['parser_normalized']}  "
+        f"need_llm={parse['need_llm']}  unparseable={parse['unparseable']}"
+    )
+    print(
+        f"TD4 误伤：受影响 {report.td4['affected_items']} 条，期望失败 {report.td4['expected_failures']} 条"
+    )
+    print(f"分片：{report.slices}")
+    print(f"重复题干：{report.duplicates}")
+    if report.line_errors:
+        print("结构性错误：")
+        for message in report.line_errors[:20]:
+            print(f"  - {message}")
+        if len(report.line_errors) > 20:
+            print(f"  … 还有 {len(report.line_errors) - 20} 条")
+    print(f"-> {out_path}")
+    if report.blocking:
+        print("阻断：" + "；".join(report.blockers))
+        return 1
+    print("preflight 通过：没有阻断项")
+    return 0
 
 
 def cmd_eval(

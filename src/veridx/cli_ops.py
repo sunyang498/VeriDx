@@ -125,6 +125,15 @@ def _build_pair(mode: str | None, *, blind_answer: str | None = None) -> tuple[A
     return primary, second
 
 
+def _extract_provider(mode: str | None) -> Any | None:
+    """隔离提取器：拿不到就返回 None（`freetext` 会 fail closed，不会退回主模型）。"""
+    from veridx.llm import factory as llm_factory
+
+    with contextlib.suppress(llm_factory.ProviderConfigError):
+        return llm_factory.build_provider(role="extract", mode=mode)
+    return None
+
+
 def _evidence_lines(rows: list[Any]) -> list[str]:
     lines = []
     for row in rows:
@@ -199,6 +208,8 @@ async def _run_case(
     conn: sqlite3.Connection,
     mode: str | None,
     explain: bool,
+    raw_input: str | None = None,
+    answer_key: str | None = None,
 ) -> Any:
     question, attempt = ensure_rows(conn, case)
     # 离线 smoke：脚本 provider 扮演"会做题的模型"（盲解答案 = 答案键）。
@@ -208,17 +219,22 @@ async def _run_case(
     runner = Runner(
         primary=primary,
         second=second,
+        extract=_extract_provider(mode),
         conn=conn,
         limits=RunLimits(explain=explain),
         tracer=TraceRecorder(conn=conn, run_id=run_id),
         run_id=run_id,
     )
+    freetext = raw_input is not None
     spec = RunSpec(
-        stem=question["stem"],
-        student_answer=attempt["student_answer"],
-        answer_key=question["correct_answer"],
+        stem="" if freetext else question["stem"],
+        student_answer="" if freetext else attempt["student_answer"],
+        answer_key=(answer_key or "") if freetext else question["correct_answer"],
         attempt_id=attempt["id"],
         question_id=question["id"],
+        input_mode="freetext" if freetext else "structured",
+        raw_input=raw_input,
+        answer_key_source="user_form",
     )
     try:
         result = await runner.run(spec)
@@ -242,6 +258,8 @@ def cmd_run(
     student: str | None,
     out: str | None,
     explain: bool,
+    raw: str | None = None,
+    answer_key: str | None = None,
 ) -> int:
     from veridx.store import db as store_db
 
@@ -249,13 +267,22 @@ def cmd_run(
     path = Path(db_path) if db_path else config.get_settings().db_path
     conn, _applied = store_db.init_db(path)
     try:
-        if case_id:
+        if raw is not None:
+            # `freetext` 模式（方案 §1）：一个框贴题 → 隔离提取 → 归属核验 → 归一化 → 主流程
+            case = Case(
+                id="q-freetext",
+                stem=raw[:80],
+                answer_key=answer_key or "",
+                student="(from ext)",
+                course="math",
+            )
+        elif case_id:
             case = load_case(case_id, conn)
             if case is None:
                 print(f"找不到题：{case_id}（datasets/ 与 {path} 里都没有）")
                 return 1
         else:
-            print("缺少 --case（或 --stem/--student/--answer-key）")
+            print("缺少 --case（或 --raw 走 freetext）")
             return 1
         if student is not None:
             case = Case(
@@ -266,7 +293,16 @@ def cmd_run(
                 course=case.course,
             )
         try:
-            result = asyncio.run(_run_case(case, conn=conn, mode=mode, explain=explain))
+            result = asyncio.run(
+                _run_case(
+                    case,
+                    conn=conn,
+                    mode=mode,
+                    explain=explain,
+                    raw_input=raw,
+                    answer_key=answer_key,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - 失败也要可排查
             print("terminal:   failed")
             print(f"reason:     {ReasonCode.INTERNAL_ERROR.value}")

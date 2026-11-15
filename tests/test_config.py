@@ -10,9 +10,10 @@ from veridx import config
 
 
 def test_llm_call_budget_adds_up() -> None:
-    """§2.3.2 最容易算不平的一处：1 + 2 + 3 + 1 = 7。"""
-    assert sum(config.NODE_MAX_CALLS.values()) == config.MAX_LLM_CALLS == 7
-    assert config.LOCAL_TOOL_MAX_CALLS == 3  # 纯本地，不计入 7 次
+    """§2.3.2 最容易算不平的一处：1 + 1 + 2 + 3 + 1 = 8（方案 §7 加了 1 次隔离提取）。"""
+    assert sum(config.NODE_MAX_CALLS.values()) == config.MAX_LLM_CALLS == 8
+    assert config.NODE_MAX_CALLS["extract"] == 1, "隔离提取必须单独记一格，否则预算会算不平"
+    assert config.LOCAL_TOOL_MAX_CALLS == 3  # 纯本地，不计入 8 次
 
 
 def test_two_token_dimensions_are_independent() -> None:

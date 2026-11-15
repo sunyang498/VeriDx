@@ -44,6 +44,7 @@ class MockProvider:
         temperature: float | None = 0.2,
         seed: int | None = None,
         response_format: str | None = None,
+        max_tokens: int | None = None,
     ) -> ChatResult:
         self.calls.append(
             {
@@ -51,6 +52,7 @@ class MockProvider:
                 "temperature": temperature,
                 "seed": seed,
                 "response_format": response_format,
+                "max_tokens": max_tokens,
             }
         )
         if self.delay_seconds:

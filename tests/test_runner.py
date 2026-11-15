@@ -148,7 +148,10 @@ async def test_end_to_end_diagnosed() -> None:
     assert result.explanation is not None and len(result.explanation.steps) >= MIN_STEPS
     assert result.llm_calls == 3, "blind_solve + diagnose + explain"
     nodes = [event.node for event in tracer.events()]
-    assert nodes[0] == "parse"
+    # 归一化发生在 parse 阶段**内部**，它的 trace 事件因此可能先于 parse 的"完成"事件；
+    # 两者都属于输入解析这一段，所以都算合法首节点。
+    assert nodes[0] in {"parse", "normalize"}
+    assert "parse" in nodes
     assert {"parse", "blind_solve", "check_numeric", "guard", "explain", "submit"} <= set(nodes)
 
 

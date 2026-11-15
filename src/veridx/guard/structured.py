@@ -144,8 +144,13 @@ async def call_structured(
     temperature: float | None = None,
     seed: int | None = None,
     node: str = NodeName.DIAGNOSE.value,
+    max_tokens: int | None = None,
 ) -> StructuredResult:
-    """调结构化输出。成功返回 `StructuredResult`；失败抛 `StructuredOutputError`。"""
+    """调结构化输出。成功返回 `StructuredResult`；失败抛 `StructuredOutputError`。
+
+    `max_tokens` 只给**输出很短**的隔离调用用（提取器 800 / 归一化器 200，方案 §7）：
+    主流程不传，沿用提供方默认，避免把诊断回复截断。
+    """
     retries = config.GUARD_MAX_RETRIES if max_retry is None else max_retry
     conversation = list(messages)
     attempts: list[dict[str, Any]] = []
@@ -202,6 +207,7 @@ async def call_structured(
                 temperature=temperature,
                 seed=seed,
                 response_format="json",
+                max_tokens=max_tokens,
             )
         except ProviderError as exc:
             usage_total += 0
