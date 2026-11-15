@@ -411,7 +411,9 @@ class Runner:
                 "answer_key_source": spec.answer_key_source,
                 "detected_lang": draft.detected_lang,
                 "layout_hint": draft.layout_hint,
-                "stem_span": list(draft.stem_span),
+                # v1.1：偏移是**服务端算的**（审计用），不是模型给的
+                "segments": outcome.segments.to_detail() if outcome.segments else None,
+                "verbatim": "ok",
             },
             item_id=spec.item_id,
         )

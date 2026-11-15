@@ -4,7 +4,8 @@
 
 * `parser` —— 确定性重写（零随机、无网络、无沙箱），覆盖 LaTeX 与常见记法；
 * `model`  —— 隔离小模型（无工具、单轮、temperature=0、输出 200 token 封顶）；
-* `gate`   —— 双闸与三档结论，**唯一**决定"能不能拿去判等"的地方。
+* `gate`   —— 双闸与三档结论，**唯一**决定"能不能拿去判等"的地方；
+* `static` —— "能不能被沙箱静态解析"的**唯一**判据（gate 与 preflight 共用）。
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from veridx.normalize.gate import (
     normalize_side,
 )
 from veridx.normalize.parser import NORMALIZER_VERSION, ParseResult, to_expr
+from veridx.normalize.static import static_parse_ok
 
 __all__ = [
     "CONFLICT",
@@ -32,5 +34,6 @@ __all__ = [
     "both_sides_verified",
     "judge_safe",
     "normalize_side",
+    "static_parse_ok",
     "to_expr",
 ]

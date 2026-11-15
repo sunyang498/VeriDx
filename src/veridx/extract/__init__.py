@@ -10,17 +10,24 @@ from __future__ import annotations
 
 from veridx.extract.extractor import ExtractOutcome, run_extract
 from veridx.extract.schema import CanonicalProblem, ExtractDraft, FieldSource, UntrustedJudgedInput
-from veridx.extract.span import locate, resolve_span, verify_span, ws_normalize
+from veridx.extract.span import (
+    SegmentCheck,
+    check_segments,
+    locate,
+    verify_verbatim,
+    ws_normalize,
+)
 
 __all__ = [
     "CanonicalProblem",
     "ExtractDraft",
     "ExtractOutcome",
     "FieldSource",
+    "SegmentCheck",
     "UntrustedJudgedInput",
+    "check_segments",
     "locate",
-    "resolve_span",
     "run_extract",
-    "verify_span",
+    "verify_verbatim",
     "ws_normalize",
 ]

@@ -187,18 +187,11 @@ def _cn_value(text: str) -> int | None:
     return None
 
 
-def _span_of(raw: str, chunk: str) -> tuple[int, int]:
-    """`chunk` 在 `raw` 里的位置；返回**去掉首尾空白后**的区间（与 `verify_span` 的空白归一一致）。"""
-    start = raw.find(chunk) if chunk else 0
-    if start < 0:
-        start = 0
-    trimmed = chunk.strip() if chunk else ""
-    offset = chunk.find(trimmed) if trimmed else 0
-    return (start + offset, start + offset + len(trimmed))
-
-
 def _extract_reply(prompt: str) -> str:
-    """脚本提取器：按"学生答案："把原文切成题干与作答，并给出**真实偏移**。"""
+    """脚本提取器：按"学生答案："把原文切成题干与作答。
+
+    v1.1：**不返回偏移**（模型不该数字符），只返回逐字片段。
+    """
     match = _RAW_BLOCK.search(prompt)
     raw = match.group(1) if match else ""
     stem, student = raw, None
@@ -208,15 +201,11 @@ def _extract_reply(prompt: str) -> str:
             stem = raw[:index]
             student = raw[index + len(marker) :]
             break
-    stem_span = _span_of(raw, stem)
-    student_span = _span_of(raw, student) if student is not None else None
     has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in raw)
     return json.dumps(
         {
             "stem": stem.strip(),
-            "stem_span": list(stem_span),
             "student_answer": student.strip() if student is not None and student.strip() else None,
-            "student_answer_span": list(student_span) if student_span else None,
             "detected_lang": "zh" if has_cjk else "en",
             "layout_hint": "with_answer_line" if student is not None else "single",
         },

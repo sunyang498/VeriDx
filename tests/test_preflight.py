@@ -51,6 +51,24 @@ def test_structurally_broken_rows_are_reported_line_by_line(tmp_path: Path) -> N
     assert "必须是字符串" in joined
 
 
+def test_implicit_multiplication_is_not_an_unparseable_gap(tmp_path: Path) -> None:
+    """审查 §3.2 的盲区：`3\\pi` / `2x` 曾被 preflight 记成 `parse_ok`，于是"没问题"。
+
+    现在它们要么被判成 `parser_normalized`（修好了），要么被判成 `need_llm`/`unparseable`（会阻断）。
+    """
+    path = _write(
+        tmp_path / "implicit.jsonl",
+        [
+            {"id": "q1", "stem": "求 3π 的值", "correct": r"3\pi", "student": "2x"},
+            {"id": "q2", "stem": "求值", "correct": r"\frac{1}{2}x", "student": r"\sqrt{2}x"},
+        ],
+    )
+    report = run_preflight(path)
+    assert report.parse["parse_ok"] == 0, f"隐式乘法不该再被记成 parse_ok：{report.parse}"
+    assert report.parse["parser_normalized"] == 4, report.parse
+    assert report.blocking is False
+
+
 def test_unparseable_ratio_above_threshold_blocks(tmp_path: Path) -> None:
     rows = [{"id": f"q{i}", "stem": "题", "correct": "1", "student": "2"} for i in range(10)]
     rows[0]["correct"] = r"\weird{x}"  # 残留 TeX → 需要模型

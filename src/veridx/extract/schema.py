@@ -32,26 +32,20 @@ class FieldSource(StrEnum):
 
 
 class ExtractDraft(BaseModel):
-    """**严格、有界、可核**。`extra="forbid"`：模型多给一个字段就整条拒。"""
+    """**严格、有界、逐字可定位**。`extra="forbid"`：模型多给一个字段就整条拒。
+
+    ⚠️ v1.1（方案 §2.2）：**不要模型给偏移**。实测让千问数字符的准确率只有 2/5，
+    而让它"输出原文片段"是它的强项。偏移由服务端 `locate()` 算，落 trace 供审计 ——
+    安全性不依赖"输出版式"，只依赖"能不能在原文里逐字定位到"。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     stem: str = Field(min_length=1, max_length=config.STEM_MAX_CHARS)
     student_answer: str | None = Field(default=None, max_length=config.SANDBOX_MAX_EXPR_LEN)
-    #: 逐字出处：`[start, end)`，0 基，指向**原始文本**的字符偏移
-    stem_span: tuple[int, int]
-    student_answer_span: tuple[int, int] | None = None
     detected_lang: Literal["zh", "en", "mixed"]
     #: 只允许枚举：自由文本会被原样搬到下游，那等于开了一条新的注入通道
     layout_hint: Literal["single", "with_solution", "with_answer_line", "unknown"] = "unknown"
-
-    @model_validator(mode="after")
-    def _spans_line_up(self) -> ExtractDraft:
-        if self.student_answer is None and self.student_answer_span is not None:
-            raise ValueError("student_answer 为空时不该给 span")
-        if self.student_answer is not None and self.student_answer_span is None:
-            raise ValueError("student_answer 非空时必须给 span（否则无法核对出处）")
-        return self
 
 
 class UntrustedJudgedInput(ValueError):
@@ -71,11 +65,9 @@ class CanonicalProblem(BaseModel):
 
     stem: str
     stem_source: FieldSource
-    stem_span: tuple[int, int] | None = None
 
     student_answer: str | None = None
     student_answer_source: FieldSource = FieldSource.DEFAULT
-    student_answer_span: tuple[int, int] | None = None
 
     #: ② 判据输入：**绝不允许 EXTRACTED**
     answer_key: str | None = None
@@ -87,6 +79,10 @@ class CanonicalProblem(BaseModel):
 
     input_mode: Literal["structured", "freetext"] = "structured"
     detected_lang: Literal["zh", "en", "mixed"] = "zh"
+
+    #: v1.1：这些偏移**不是模型给的**，是服务端 `locate()` 算出来的（审计用）
+    stem_span: tuple[int, int] | None = None
+    student_answer_span: tuple[int, int] | None = None
 
     @model_validator(mode="after")
     def _enforce_provenance(self) -> CanonicalProblem:
@@ -102,11 +98,8 @@ class CanonicalProblem(BaseModel):
             if source is FieldSource.DEFAULT and value not in (None, (), "", "numeric"):
                 # 有值却说是"默认策略" = 出处丢了（`answer_key` 尤其危险）
                 raise ValueError(f"`{name}` 有值但 source=DEFAULT：出处不明")
-        # 任一 EXTRACTED 字段必须带 span
-        if self.stem_source is FieldSource.EXTRACTED and self.stem_span is None:
-            raise ValueError("stem 来自提取器时必须带 span")
-        if self.student_answer_source is FieldSource.EXTRACTED and self.student_answer_span is None:
-            raise ValueError("student_answer 来自提取器时必须带 span")
+        # v1.1：EXTRACTED 字段**不要求**带 span（模型不报偏移）；
+        # 逐字可定位由 `extract.extractor` 在装配时强制，落 trace 供审计。
         return self
 
     @property

@@ -30,6 +30,7 @@ from typing import Literal
 
 from veridx.normalize.model import normalize_with_model
 from veridx.normalize.parser import to_expr
+from veridx.normalize.static import static_parse_ok
 from veridx.sandbox import compare
 from veridx.trace.event import NodeName
 from veridx.trace.recorder import TraceRecorder
@@ -71,8 +72,13 @@ class NormalizeOutcome:
 
     @property
     def usable(self) -> bool:
-        """能不能拿去做判等（方案 §3.3）。`verified` 与 `unchanged` 都可以。"""
-        return self.verdict in {VERIFIED, UNCHANGED}
+        """能不能拿去做判等（方案 §3.3 + 审查 §3.5）.
+
+        **两条都要满足**：
+        ① 结论是 `verified` / `unchanged`；
+        ② 归一化结果**能被沙箱静态解析** —— 否则 `verified` 只是"解析器自己说成功"。
+        """
+        return self.verdict in {VERIFIED, UNCHANGED} and static_parse_ok(self.normalized)
 
     def to_detail(self) -> dict[str, object]:
         return {

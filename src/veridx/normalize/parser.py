@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from veridx.normalize.static import static_parse_ok
+
 __all__ = ["NORMALIZER_VERSION", "ParseResult", "to_expr"]
 
 #: 归一化器版本（进报告头；跨 run 对比时必须相同，方案 §6.2 第 3 条）
@@ -68,10 +70,19 @@ _BOXED = re.compile(r"\\(?:boxed|mathbf)\s*\{([^{}]*)\}")
 #: 排版盒子：`\text{cm}`、`\mathrm{d}` —— 内容**不一定是数值**，剥壳后要复核
 _TYPESET = re.compile(r"\\(?:text|mathrm|operatorname)\s*\{([^{}]*)\}")
 _SUP = re.compile(r"\^\{([^{}]*)\}")
+#: 无花括号的幂：`x^2` → `x**(2)`；`(?<!\*)` 保证不误伤已经写好的 `**`
+_CARET = re.compile(r"(?<![*])\^(?!\*)\s*([A-Za-z0-9.]+)")
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*\\?%")
 _THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 #: 归一化后允许出现的字符（沙箱能解析的子集）。出现别的字符 → 判"没把握"。
 _PLAUSIBLE = re.compile(r"^[\d\s.+\-*/()^_a-zA-Z]+$")
+
+#: **隐式乘法**（审查 §3.1）：`3\pi`、`2x`、`2(x+1)`、`\frac{1}{2}x`、`\sqrt{2}x`
+#: 在中国数学题里是主流写法，不插 `*` 就会被沙箱判 `parse_error` → 整题掉出评测分母。
+#:   · 左邻：数字 或 `)`
+#:   · 右邻：字母 或 `(` 或 `\`（TeX 命令，此时尚未完全替换）
+#:   · **排除**科学计数法 `1e5` / `2E-3`（那本来就是合法的 Python 字面量）
+_IMPLICIT_MUL = re.compile(r"(?<=[0-9)])(\s*)(?=(?!e[+-]?\d)(?!E[+-]?\d)(?:[A-Za-z(]|\\))")
 
 
 @dataclass
@@ -152,6 +163,12 @@ def to_expr(raw: str) -> ParseResult:
         text = _SUP.sub(lambda m: f"**({m.group(1)})", text)
         notes.append("sup_braced")
 
+    # `x^2` / `(x+1)^3`：无花括号的幂。Python 的 `^` 是异或（对符号直接 parse_error），
+    # 所以必须转成 `**`；`**` 本身不能被误伤（负向前瞻）。
+    if _CARET.search(text):
+        text = _CARET.sub(lambda m: f"**({m.group(1)})", text)
+        notes.append("caret_pow")
+
     for needle, replacement in _EXACT_REPLACEMENTS:
         if needle in text:
             text = text.replace(needle, replacement)
@@ -171,6 +188,11 @@ def to_expr(raw: str) -> ParseResult:
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"(?<=\d)\s+(?=[+\-*/)])", "", text)
     text = re.sub(r"(?<=[+\-*/])\s+(?=\d)", "", text)
+
+    # 隐式乘法必须**最后**做：前面的替换会造出新的"数字紧邻字母"（`3\pi` → `3pi`）
+    if _IMPLICIT_MUL.search(text):
+        text = _IMPLICIT_MUL.sub("*", text)
+        notes.append("implicit_mul")
 
     if not text:
         return ParseResult(text="", ok=False, notes=[*notes, "empty_after_normalize"])
@@ -195,5 +217,10 @@ def to_expr(raw: str) -> ParseResult:
 
     if not _PLAUSIBLE.match(text):
         return ParseResult(text=text, ok=False, notes=[*notes, "implausible_chars"])
+
+    # 最后一个闸：**必须能被沙箱静态解析**（审查 §3.3）
+    # 只判"解析器自己 ok"就是第 6 次"上游自报成功当下游能吃"的错误。
+    if not static_parse_ok(text):
+        return ParseResult(text=text, ok=False, notes=[*notes, "not_static_parseable"])
 
     return ParseResult(text=text, ok=True, changed=text != raw.strip(), notes=notes)

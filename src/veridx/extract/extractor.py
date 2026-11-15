@@ -20,7 +20,7 @@ from typing import Any
 from veridx import config
 from veridx.extract import prompt as prompt_mod
 from veridx.extract.schema import ExtractDraft
-from veridx.extract.span import resolve_span
+from veridx.extract.span import SegmentCheck, check_segments, verify_verbatim
 from veridx.guard.structured import Budget, StructuredOutputError, call_structured
 from veridx.llm.base import LLMProvider
 from veridx.trace.event import NodeName, ReasonCode
@@ -44,6 +44,8 @@ class ExtractOutcome:
     tokens_out: int = 0
     attempts: int = 0
     notes: list[str] = field(default_factory=list)
+    #: §2.4 的机械检查结果（M1 拒绝时 `ok=False`；M2/M3 只记录）
+    segments: SegmentCheck | None = None
 
 
 async def run_extract(
@@ -104,10 +106,10 @@ async def run_extract(
         return outcome
 
     draft = result.model
-    # ---- 出处核验：提取器说了"这段是题干"，必须能在原文里逐字找到 ----
-    # 模型给的偏移只作为**首选**；错了就用精确定位重算（模型只负责"选哪段"，不负责算位置）
-    stem_ok, stem_span, stem_how = resolve_span(raw, draft.stem, draft.stem_span)
-    if not stem_ok:
+    # ---- 出处核验（v1.1）：每段文本必须能在原文里**逐字定位**到 ----
+    # 模型只输出文本，偏移由我们算（实测它报偏移的准确率只有 2/5）
+    stem_located = verify_verbatim(raw, draft.stem)
+    if not stem_located.ok:
         outcome = ExtractOutcome(
             ok=False,
             reason_code=ReasonCode.PROVENANCE_MISMATCH.value,
@@ -116,18 +118,16 @@ async def run_extract(
             tokens_in=result.usage_in,
             tokens_out=result.usage_out,
             attempts=len(result.attempts),
-            notes=["stem_span_mismatch", f"span:{stem_how}"],
+            notes=["stem_not_verbatim"],
         )
         _trace_result(tracer, outcome)
         return outcome
 
-    answer_span = draft.student_answer_span
-    answer_how = "none"
+    answer_located = None
     if draft.student_answer is not None:
-        answer_ok, answer_span, answer_how = resolve_span(
-            raw, draft.student_answer, draft.student_answer_span
-        )
-        if not answer_ok:
+        # M2 消歧：避开题干占用的那段
+        answer_located = verify_verbatim(raw, draft.student_answer, avoid=stem_located.span)
+        if not answer_located.ok:
             outcome = ExtractOutcome(
                 ok=False,
                 reason_code=ReasonCode.PROVENANCE_MISMATCH.value,
@@ -136,13 +136,26 @@ async def run_extract(
                 tokens_in=result.usage_in,
                 tokens_out=result.usage_out,
                 attempts=len(result.attempts),
-                notes=["student_answer_span_mismatch", f"span:{answer_how}"],
+                notes=["student_answer_not_verbatim"],
             )
             _trace_result(tracer, outcome)
             return outcome
 
-    # 用核对过的 span 覆盖模型给的（下游只认这一份）
-    draft = draft.model_copy(update={"stem_span": stem_span, "student_answer_span": answer_span})
+    # ---- §2.4 三条机械检查：M1 会拒，M2/M3 只记录 ----
+    segments = check_segments(raw, stem=stem_located, student_answer=answer_located)
+    if not segments.ok:
+        outcome = ExtractOutcome(
+            ok=False,
+            reason_code=ReasonCode.PROVENANCE_MISMATCH.value,
+            draft=draft,
+            nonce=nonce,
+            tokens_in=result.usage_in,
+            tokens_out=result.usage_out,
+            attempts=len(result.attempts),
+            notes=list(segments.flags),
+        )
+        _trace_result(tracer, outcome)
+        return outcome
 
     outcome = ExtractOutcome(
         ok=True,
@@ -151,10 +164,8 @@ async def run_extract(
         tokens_in=result.usage_in,
         tokens_out=result.usage_out,
         attempts=len(result.attempts),
-        notes=[
-            "span_ok" if stem_how == "model" else f"span_recomputed:{stem_how}",
-            f"answer_span:{answer_how}",
-        ],
+        notes=["verbatim_ok", f"stem_how:{stem_located.how}", *segments.flags],
+        segments=segments,
     )
     _trace_result(tracer, outcome)
     return outcome
@@ -172,7 +183,7 @@ def _trace_result(tracer: TraceRecorder | None, outcome: ExtractOutcome) -> None
         detail={
             "stage": "result",
             "ok": outcome.ok,
-            "span_ok": outcome.ok,
+            "verbatim_ok": outcome.ok,
             "attempt_index": max(outcome.attempts - 1, 0),
             "attempts": outcome.attempts,
             "nonce": outcome.nonce,
@@ -180,5 +191,7 @@ def _trace_result(tracer: TraceRecorder | None, outcome: ExtractOutcome) -> None
             "student_answer_present": bool(outcome.draft and outcome.draft.student_answer),
             "detected_lang": outcome.draft.detected_lang if outcome.draft else None,
             "layout_hint": outcome.draft.layout_hint if outcome.draft else None,
+            # 服务端算出来的定位区间（审计用；**不是模型给的**）
+            "segments": outcome.segments.to_detail() if outcome.segments else None,
         },
     )

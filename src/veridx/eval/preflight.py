@@ -15,6 +15,7 @@ from typing import Any
 
 from veridx.flow.blind_solve import collision_prob
 from veridx.normalize.parser import NORMALIZER_VERSION, to_expr
+from veridx.normalize.static import static_parse_ok
 
 __all__ = ["PREFLIGHT_VERSION", "PreflightReport", "row_errors", "run_preflight"]
 
@@ -42,13 +43,22 @@ def row_errors(raw: Any, lineno: int) -> list[str]:
 
 
 def _classify(value: str) -> str:
-    """C-2：一格里只有一种结论，四个格子互斥且穷尽。"""
+    """C-2：一格里只有一种结论，四个格子互斥且穷尽。
+
+    **必须验到"沙箱能吃"这一层**（审查 §3.3）：只看 `to_expr().ok` 会把
+    "解析器自己说成功"当成"沙箱能吃"，于是 `3\\pi` / `2x` 被记成 `parse_ok`，
+    preflight 就会对着会掉出分母的数据说"没问题"。
+    `to_expr` 现在已内置 `static_parse_ok`，这里再核一遍是**契约断言**：
+    它一旦失效，preflight 必须当场把这类数据记成 `unparseable`，而不是继续报平安。
+    """
     parsed = to_expr(value)
-    if not parsed.ok:
-        return "unparseable" if not parsed.text or "\\" in parsed.text else "need_llm"
-    if parsed.changed:
-        return "parser_normalized"
-    return "parse_ok"
+    if parsed.ok:
+        if not static_parse_ok(parsed.text):  # 防御性断言：to_expr 的闸失效了
+            return "unparseable"
+        return "parser_normalized" if parsed.changed else "parse_ok"
+    if not parsed.text or "\\" in parsed.text:
+        return "unparseable"
+    return "need_llm"
 
 
 @dataclass

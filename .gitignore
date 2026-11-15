@@ -53,6 +53,12 @@ web/*.tsbuildinfo
 /doc/review/
 /doc/面试/
 
+# ---- 数据集（2026-11-15 决定：公开数据集**不进仓库**）----
+# 只留仓库自带的契约样例（smoke），其余一律本地：来源、许可、体积都不适合进 git。
+/datasets/*
+!/datasets/smoke.json
+!/datasets/smoke.jsonl
+
 # ---- 评测产物（生成物：带时间戳与随机 run_id，不可复现；口径随报告头里的 version 变）----
 /eval/tmp/
 /eval/reports/*.json

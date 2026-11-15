@@ -23,10 +23,13 @@ from veridx.normalize import (
     both_sides_verified,
     judge_safe,
     normalize_side,
+    static_parse_ok,
     to_expr,
 )
+from veridx.sandbox import evaluate
 
-#: 方案 §9.1 第 1 条：这 20 个必须全部由确定性解析器搞定（一个都不该调模型）
+#: 方案 §9.1 第 1 条（**v1.1 修订**）：这 20 个必须既**无需模型**、又能被沙箱静态解析。
+#: 审查 §3.4 认的账：v1.0 只要求"无需模型"，于是实现自然会优化成"解析器不报错就算过"。
 LATEX_SAMPLES: tuple[tuple[str, str], ...] = (
     (r"\frac{5}{7}", "((5)/(7))"),
     (r"$\frac{5}{7}$", "((5)/(7))"),
@@ -50,12 +53,105 @@ LATEX_SAMPLES: tuple[tuple[str, str], ...] = (
     (r"\frac{\frac{1}{2}}{3}", "((((1)/(2)))/(3))"),
 )
 
+#: 审查 §3.1 点名的**隐式乘法**（中国数学题的主流写法，不是边缘 case）
+IMPLICIT_MUL_SAMPLES: tuple[tuple[str, str], ...] = (
+    (r"3\pi", "3*pi"),
+    (r"2x", "2*x"),
+    (r"2(x+1)", "2*(x+1)"),
+    (r"\frac{1}{2}x", "((1)/(2))*x"),
+    (r"\sqrt{2}x", "sqrt(2)*x"),
+    (r"x^2", "x**(2)"),
+    (r"(x+1)^3", "(x+1)**(3)"),
+)
+
 
 @pytest.mark.parametrize(("raw", "expected"), LATEX_SAMPLES)
 def test_deterministic_parser_covers_the_twenty_samples(raw: str, expected: str) -> None:
     parsed = to_expr(raw)
     assert parsed.ok, f"{raw!r} 不该需要模型：notes={parsed.notes}"
     assert parsed.text == expected
+
+
+@pytest.mark.parametrize(("raw", "expected"), LATEX_SAMPLES)
+def test_every_sample_is_statically_parseable_by_the_sandbox(raw: str, expected: str) -> None:
+    """审查 §3.4：DoD 不能只衡量"省了多少模型调用"，必须衡量"产出能不能用"。"""
+    assert static_parse_ok(expected), f"{raw!r} → {expected!r} 沙箱吃不下"
+    assert evaluate(expected).verdict.value in {"ok"}
+    del raw
+
+
+@pytest.mark.parametrize(("raw", "expected"), IMPLICIT_MUL_SAMPLES)
+def test_implicit_multiplication_is_inserted(raw: str, expected: str) -> None:
+    """审查 §3.1：`3\\pi` / `2x` / `\\frac{1}{2}x` 是主流写法，不插 `*` 会掉出评测分母。"""
+    parsed = to_expr(raw)
+    assert parsed.ok, f"{raw!r} 解析失败：{parsed.notes}"
+    assert parsed.text == expected
+    assert static_parse_ok(parsed.text), f"{raw!r} → {parsed.text!r} 沙箱吃不下"
+
+
+async def test_implicit_multiplication_is_verified_and_usable() -> None:
+    """审查 §3.1 的原始症状：`3\\pi` 曾报 `verified` + `usable=True`，但沙箱判 `unsupported`。
+
+    现在两条都必须成立：**verified** 且 **能被沙箱静态解析**。
+    （含自由符号的式子 `2*x` 静态可解析、但**求值**是 `symbolic` —— 那是值域问题，不是解析问题。）
+    """
+    cases = {
+        "3\\pi": "3*pi",
+        "2x": "2*x",
+        "\\frac{1}{2}x": "((1)/(2))*x",
+    }
+    for raw, expr in cases.items():
+        assert static_parse_ok(expr), f"{raw} → {expr} 静态解析失败"
+        outcome = await normalize_side(raw, side="answer_key")
+        assert outcome.usable is True, f"{raw} 应可用：{outcome.notes}"
+        assert static_parse_ok(outcome.normalized)
+
+    # 纯数值那条必须能真的求值（这正是"掉出评测分母"的那一类）
+    assert evaluate("3*pi").verdict.value == "ok"
+    # 含符号的那条：可静态解析即可（求值给 symbolic 是设计行为）
+    assert evaluate("2*x").reason.startswith("symbolic")
+
+
+def test_capacity_is_not_a_parse_failure() -> None:
+    """`not_representable:digits=N` 是**容量**判据，不是语法问题。
+
+    把它算成"解析失败"会掩盖真正的终态：答案不可表示应报 `answer_unrepresentable`，
+    而不是 `normalization_unverified`（否则"容量问题"会被读成"归一化没接上"）。
+    """
+    from veridx.normalize.static import static_parse_ok
+    from veridx.sandbox.guard import static_check
+
+    huge = "999999999**200 * 999999999**200 * 999999999**200"
+    checked = static_check(huge)
+    assert checked is not None and checked[1].startswith("not_representable")
+    assert static_parse_ok(huge) is True, "语法合法，只是数值太大"
+
+    # 真正的语法/能力问题仍然判失败
+    assert static_parse_ok("2*") is False
+    assert static_parse_ok("__import__('os')") is False
+    assert static_parse_ok("abc") is False, "未知符号不可能被算出来"
+
+
+def test_forbidden_calls_are_not_accepted_as_parsed() -> None:
+    """审查 §3.3 的第二种形态：能 `ast.parse` ≠ 沙箱能吃。
+
+    `eval(1)` 语法合法、`_PLAUSIBLE` 也放行，但 `static_check` 判 `forbidden_call` ——
+    没有这道闸，它会被记成 `parse_ok` 并送进判等。
+    """
+    from veridx.normalize.static import static_parse_ok
+    from veridx.sandbox.guard import static_check
+
+    assert static_check("eval(1)") is not None
+    assert static_parse_ok("eval(1)") is False
+    assert to_expr("eval(1)").ok is False
+    assert "not_static_parseable" in to_expr("eval(1)").notes
+
+
+def test_scientific_notation_is_not_broken() -> None:
+    """隐式乘法不能误伤 `1e5` / `2E-3`（它们本来就是合法字面量）。"""
+    assert to_expr("1e5").text == "1e5"
+    assert to_expr("2E-3").text == "2E-3"
+    assert static_parse_ok("1e5")
 
 
 async def test_eighteen_of_twenty_need_no_model() -> None:
