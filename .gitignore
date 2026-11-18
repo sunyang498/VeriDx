@@ -63,3 +63,10 @@ web/*.tsbuildinfo
 /eval/tmp/
 /eval/reports/*.json
 /eval/reports/*.md
+/eval/reports/*.txt
+
+# ---- judge 产物（与 /datasets 同策略：都是公开数据集的衍生物，需本地重新生成）----
+# 重新生成：python judge/adapt.py   判分产物：python judge/run.py --report <报告>
+/judge/data/
+/judge/reports/
+/judge/labels_*_todo.csv

@@ -136,17 +136,23 @@ def run_preflight(path: Path) -> PreflightReport:
             slices[f"source:{raw['source']}"] += 1
 
     pairs = good_rows * 2
+    # C-6 的口径是「**不可解析 + unverified** > 10%」：
+    # `need_llm` 属于后者 —— 它得靠模型才能用，而**答案键永远不能过模型**（ADR-021），
+    # 所以把这些行算成"没问题"会让一批题静默变成 escalated。
     total_unusable = parse_counts["unparseable"]
+    total_risky = total_unusable + parse_counts["need_llm"]
     ratio = (total_unusable / pairs) if pairs else 0.0
+    ratio_risky = (total_risky / pairs) if pairs else 0.0
     duplicates = len(stems) - len({hashlib.sha256(s.encode("utf-8")).hexdigest()[:16] for s in stems})
 
     blockers: list[str] = []
     if line_errors:
         blockers.append(f"结构性错误 {len(line_errors)} 条（逐行见 line_errors）")
-    if pairs and ratio > BLOCKING_RATIO:
+    if pairs and ratio_risky > BLOCKING_RATIO:
         blockers.append(
-            f"不可解析 {total_unusable}/{pairs} = {ratio:.1%} > {BLOCKING_RATIO:.0%}："
+            f"不可解析+需模型 {total_risky}/{pairs} = {ratio_risky:.1%} > {BLOCKING_RATIO:.0%}："
             "先把归一化补齐，否则这些题会直接掉出评测分母"
+            f"（其中完全不可解析 {total_unusable} 侧）"
         )
 
     return PreflightReport(
@@ -156,8 +162,8 @@ def run_preflight(path: Path) -> PreflightReport:
         blocking=bool(blockers),
         parse=dict(parse_counts),
         normalize_risk={
-            # 期望冲突数：模型与解析器都可能说错，这里只报"需要模型介入"的量
-            "need_llm": parse_counts["need_llm"] + parse_counts["unparseable"],
+            "need_llm": total_risky,
+            "need_llm_ratio": round(ratio_risky, 4),
             "unparseable_ratio": round(ratio, 4),
         },
         td4={
